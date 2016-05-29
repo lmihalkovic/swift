@@ -577,6 +577,16 @@ resolveImmutableBase(Expr *expr, ConstraintSystem &CS) {
   return { expr, nullptr };
 }
 
+static bool isLoadedLValue(Expr *expr) {
+  expr = expr->getSemanticsProvidingExpr();
+  if (isa<LoadExpr>(expr))
+    return true;
+  if (auto ifExpr = dyn_cast<IfExpr>(expr))
+    return isLoadedLValue(ifExpr->getThenExpr())
+        && isLoadedLValue(ifExpr->getElseExpr());
+  return false;
+}
+
 static void diagnoseSubElementFailure(Expr *destExpr,
                                       SourceLoc loc,
                                       ConstraintSystem &CS,
@@ -672,6 +682,16 @@ static void diagnoseSubElementFailure(Expr *destExpr,
         .highlight(ICE->getSourceRange());
       return;
     }
+
+  if (auto IE = dyn_cast<IfExpr>(immInfo.first)) {
+    if (isLoadedLValue(IE)) {
+      TC.diagnose(loc, diagID,
+                  "result of conditional operator '? :' is never mutable")
+        .highlight(IE->getQuestionLoc())
+        .highlight(IE->getColonLoc());
+      return;
+    }
+  }
 
   TC.diagnose(loc, unknownDiagID, destExpr->getType())
     .highlight(immInfo.first->getSourceRange());
@@ -1806,8 +1826,8 @@ public:
 
   /// Diagnose common failures due to applications of an argument list to an
   /// ApplyExpr or SubscriptExpr.
-  bool diagnoseParameterErrors(CalleeCandidateInfo &CCI, Expr *fnExpr,
-                               Expr *argExpr);
+  bool diagnoseParameterErrors(CalleeCandidateInfo &CCI,
+                               Expr *fnExpr, Expr *argExpr);
 
   /// Attempt to diagnose a specific failure from the info we've collected from
   /// the failed constraint system.
@@ -2904,6 +2924,12 @@ typeCheckChildIndependently(Expr *subExpr, Type convertType,
       TCEOptions |= TypeCheckExprFlags::PreferForceUnwrapToOptional;
   }
 
+  // Ensure that the expression we're about to type-check doesn't have
+  // anything that the type-checker doesn't expect to see.  This can happen
+  // because of repeated type-checking; the removal below, while independently
+  // important, isn't itself sufficient because of AST mutation.
+  eraseOpenedExistentials(subExpr);
+
   bool hadError = CS->TC.typeCheckExpression(subExpr, CS->DC,
                                              TypeLoc::withoutLoc(convertType),
                                              convertTypePurpose, TCEOptions,
@@ -3050,26 +3076,111 @@ bool FailureDiagnosis::diagnoseCalleeResultContextualConversionError() {
 }
 
 
-/// Return true if the conversion from fromType to toType is an invalid string
-/// index operation.
-static bool isIntegerToStringIndexConversion(Type fromType, Type toType,
-                                             ConstraintSystem *CS) {
+/// Return true if the given type conforms to a known protocol type.
+static bool isLiteralConvertibleType(Type fromType,
+                                     KnownProtocolKind kind,
+                                     ConstraintSystem *CS) {
   auto integerType =
-    CS->TC.getProtocol(SourceLoc(),
-                       KnownProtocolKind::IntegerLiteralConvertible);
-  if (!integerType) return false;
+    CS->TC.getProtocol(SourceLoc(), kind);
+  if (!integerType)
+    return false;
 
-  // If the from type is an integer type, and the to type is
-  // String.CharacterView.Index, then we found one.
   if (CS->TC.conformsToProtocol(fromType, integerType, CS->DC,
                                 ConformanceCheckFlags::InExpression)) {
-    if (toType->getCanonicalType().getString() == "String.CharacterView.Index")
-      return true;
+    return true;
   }
 
   return false;
 }
 
+/// Return true if the given type conforms to RawRepresentable, with an
+/// underlying type conforming to the given known protocol.
+static Type isRawRepresentable(Type fromType,
+                               KnownProtocolKind kind,
+                               ConstraintSystem *CS) {
+  auto rawReprType =
+    CS->TC.getProtocol(SourceLoc(), KnownProtocolKind::RawRepresentable);
+  if (!rawReprType)
+    return Type();
+
+  ProtocolConformance *conformance;
+  if (!CS->TC.conformsToProtocol(fromType, rawReprType, CS->DC,
+                                 ConformanceCheckFlags::InExpression,
+                                 &conformance))
+    return Type();
+
+  Type rawTy = ProtocolConformance::getTypeWitnessByName(fromType,
+                                                         conformance,
+                                  CS->getASTContext().getIdentifier("RawValue"),
+                                                         &CS->TC);
+  if (!rawTy || !isLiteralConvertibleType(rawTy, kind, CS))
+    return Type();
+
+  return rawTy;
+}
+
+/// Return true if the conversion from fromType to toType is an invalid string
+/// index operation.
+static bool isIntegerToStringIndexConversion(Type fromType, Type toType,
+                                             ConstraintSystem *CS) {
+  auto kind = KnownProtocolKind::IntegerLiteralConvertible;
+  return (isLiteralConvertibleType(fromType, kind, CS) &&
+          toType->getCanonicalType().getString() == "String.CharacterView.Index");
+}
+
+/// Attempts to add fix-its for these two mistakes:
+///
+/// - Passing an integer where a type conforming to RawRepresentable is
+///   expected, by wrapping the expression in a call to the contextual
+///   type's initializer
+///
+/// - Passing a type conforming to RawRepresentable where an integer is
+///   expected, by wrapping the expression in a call to the rawValue
+///   accessor
+///
+/// This helps migration with SDK changes.
+static void tryRawRepresentableFixIts(InFlightDiagnostic &diag,
+                                      ConstraintSystem *CS,
+                                      Diag<Type, Type> diagID,
+                                      Type fromType,
+                                      Type toType,
+                                      KnownProtocolKind kind,
+                                      Expr *expr) {
+  if (isLiteralConvertibleType(fromType, kind, CS)) {
+    if (auto rawTy = isRawRepresentable(toType, kind, CS)) {
+      // Produce before/after strings like 'Result(rawValue: RawType(<expr>))'
+      // or just 'Result(rawValue: <expr>)'.
+      std::string convWrapBefore = toType.getString();
+      convWrapBefore += "(rawValue: ";
+      std::string convWrapAfter = ")";
+      if (rawTy->getCanonicalType() != fromType->getCanonicalType()) {
+        convWrapBefore += rawTy->getString();
+        convWrapBefore += "(";
+        convWrapAfter += ")";
+      }
+      SourceRange exprRange = expr->getSourceRange();
+      diag.fixItInsert(exprRange.Start, convWrapBefore);
+      diag.fixItInsertAfter(exprRange.End, convWrapAfter);
+      return;
+    }
+  }
+
+  if (auto rawTy = isRawRepresentable(fromType, kind, CS)) {
+    if (isLiteralConvertibleType(toType, kind, CS)) {
+      std::string convWrapBefore;
+      std::string convWrapAfter = ".rawValue";
+      if (rawTy->getCanonicalType() != toType->getCanonicalType()) {
+        convWrapBefore += rawTy->getString();
+        convWrapBefore += "(";
+        convWrapAfter += ")";
+      }
+      SourceRange exprRange = expr->getSourceRange();
+      diag.fixItInsert(exprRange.Start, convWrapBefore);
+      diag.fixItInsertAfter(exprRange.End, convWrapAfter);
+      return;
+    }
+  }
+}
 
 bool FailureDiagnosis::diagnoseContextualConversionError() {
   // If the constraint system has a contextual type, then we can test to see if
@@ -3299,8 +3410,29 @@ bool FailureDiagnosis::diagnoseContextualConversionError() {
         diagID = diag::noescape_functiontype_mismatch;
     }
 
-  diagnose(expr->getLoc(), diagID, exprType, contextualType)
-    .highlight(expr->getSourceRange());
+  InFlightDiagnostic diag = diagnose(expr->getLoc(), diagID,
+                                     exprType, contextualType);
+  diag.highlight(expr->getSourceRange());
+
+  // Attempt to add a fixit for the error.
+  switch (CS->getContextualTypePurpose()) {
+  case CTP_CallArgument:
+  case CTP_ArrayElement:
+  case CTP_DictionaryKey:
+  case CTP_DictionaryValue:
+    tryRawRepresentableFixIts(diag, CS, diagID, exprType, contextualType,
+                              KnownProtocolKind::IntegerLiteralConvertible,
+                              expr);
+    tryRawRepresentableFixIts(diag, CS, diagID, exprType, contextualType,
+                              KnownProtocolKind::StringLiteralConvertible,
+                              expr);
+    break;
+
+  default:
+    // FIXME: Other contextual conversions too?
+    break;
+  }
+
   return true;
 }
 
@@ -3334,6 +3466,28 @@ void ConstraintSystem::diagnoseAssignmentFailure(Expr *dest, Type destTy,
                             diag::assignment_lhs_not_lvalue);
 }
 
+static bool isSymmetricBinaryOperator(const CalleeCandidateInfo &CCI) {
+  // If we don't have at least one known candidate, don't trigger.
+  if (CCI.candidates.empty()) return false;
+
+  for (auto &candidate : CCI.candidates) {
+    // Each candidate must be a non-assignment operator function.
+    auto decl = dyn_cast_or_null<FuncDecl>(candidate.getDecl());
+    if (!decl) return false;
+    auto op = dyn_cast_or_null<InfixOperatorDecl>(decl->getOperatorDecl());
+    if (!op || op->isAssignment()) return false;
+
+    // It must have exactly two parameters.
+    auto params = decl->getParameterLists().back();
+    if (params->size() != 2) return false;
+
+    // Require the types to be the same.
+    if (!params->get(0)->getType()->isEqual(params->get(1)->getType()))
+      return false;
+  }
+
+  return true;
+}
 
 /// Special magic to handle inout exprs and tuples in argument lists.
 Expr *FailureDiagnosis::
@@ -3364,6 +3518,11 @@ typeCheckArgumentChildIndependently(Expr *argExpr, Type argType,
       if (decl->isInstanceMember() && candidates[0].level == 0 &&
           !isa<SubscriptDecl>(decl))
         argType = Type();
+
+  // Similarly, we get better results when we don't push argument types down
+  // to symmetric operators.
+  if (argType && isSymmetricBinaryOperator(candidates))
+    argType = Type();
   
 
   // FIXME: This should all just be a matter of getting the type of the
@@ -3735,12 +3894,17 @@ bool FailureDiagnosis::diagnoseParameterErrors(CalleeCandidateInfo &CCI,
   // (often because there is only one candidate in the set), then diagnose this
   // as a specific problem of passing something of the wrong type into a
   // parameter.
+  //
+  // We don't generally want to use this path to diagnose calls to
+  // symmetrically-typed binary operators because it's likely that both
+  // operands contributed to the type.
   if ((CCI.closeness == CC_OneArgumentMismatch ||
        CCI.closeness == CC_OneArgumentNearMismatch ||
        CCI.closeness == CC_OneGenericArgumentMismatch ||
        CCI.closeness == CC_OneGenericArgumentNearMismatch ||
        CCI.closeness == CC_GenericNonsubstitutableMismatch) &&
-      CCI.failedArgument.isValid()) {
+      CCI.failedArgument.isValid() &&
+      !isSymmetricBinaryOperator(CCI)) {
     // Map the argument number into an argument expression.
     TCCOptions options = TCC_ForceRecheck;
     if (CCI.failedArgument.parameterType->is<InOutType>())
@@ -4160,6 +4324,18 @@ bool FailureDiagnosis::visitApplyExpr(ApplyExpr *callExpr) {
         .highlight(lhsExpr->getSourceRange())
         .highlight(rhsExpr->getSourceRange());
       return true;
+    }
+
+    // Diagnose attempts to compare reference equality of certain types.
+    if (overloadName == "===" || overloadName == "!==") {
+      // Functions.
+      if (lhsType->is<AnyFunctionType>() || rhsType->is<AnyFunctionType>()) {
+        diagnose(callExpr->getLoc(), diag::cannot_reference_compare_types,
+                 overloadName, lhsType, rhsType)
+          .highlight(lhsExpr->getSourceRange())
+          .highlight(rhsExpr->getSourceRange());
+        return true;
+      }
     }
     
     // If we found an exact match, this must be a problem with a conversion from
@@ -4818,8 +4994,9 @@ bool FailureDiagnosis::visitObjectLiteralExpr(ObjectLiteralExpr *E) {
   if (constrs.size() != 1 || !isa<ConstructorDecl>(constrs.front()))
     return false;
   auto *constr = cast<ConstructorDecl>(constrs.front());
+  auto paramType = TC.getObjectLiteralParameterType(E, constr);
   if (!typeCheckChildIndependently(
-        E->getArg(), constr->getArgumentType(), CTP_CallArgument))
+        E->getArg(), paramType, CTP_CallArgument))
     return true;
 
   // Conditions for showing this diagnostic:

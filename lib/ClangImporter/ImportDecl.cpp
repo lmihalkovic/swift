@@ -1300,55 +1300,10 @@ namespace {
         return nullptr;
 
       // Check for swift_newtype
-      if (!SwiftType && Impl.HonorSwiftNewtypeAttr) {
-        if (auto newtypeAttr =
-                Decl->template getAttr<clang::SwiftNewtypeAttr>()) {
-          switch (newtypeAttr->getNewtypeKind()) {
-          case clang::SwiftNewtypeAttr::NK_Enum:
-            // TODO: import as closed enum instead
-
-            // For now, fall through and treat as a struct
-          case clang::SwiftNewtypeAttr::NK_Struct: {
-
-            auto &cxt = Impl.SwiftContext;
-            auto Loc = Impl.importSourceLoc(Decl->getLocation());
-
-            auto structDecl = Impl.createDeclWithClangNode<StructDecl>(
-                Decl, Loc, Name, Loc, None, nullptr, DC);
-            structDecl->computeType();
-
-            ProtocolDecl *protocols[] = {
-                cxt.getProtocol(KnownProtocolKind::RawRepresentable),
-            };
-
-            // Import the type of the underlying storage
-            auto storedUnderlyingType = Impl.importType(
-                Decl->getUnderlyingType(), ImportTypeKind::Value,
-                isInSystemModule(DC),
-                Decl->getUnderlyingType()->isBlockPointerType(),
-                OTK_Optional);
-
-            // Find a bridged type, which may be different
-            auto computedPropertyUnderlyingType = Impl.importType(
-                Decl->getUnderlyingType(), ImportTypeKind::Property,
-                isInSystemModule(DC),
-                Decl->getUnderlyingType()->isBlockPointerType(),
-                OTK_Optional);
-
-            if (storedUnderlyingType.getCanonicalTypeOrNull() ==
-                computedPropertyUnderlyingType.getCanonicalTypeOrNull()) {
-              // Simple, our stored type is already bridged
-              makeStructRawValued(structDecl, storedUnderlyingType,
-                                  {KnownProtocolKind::RawRepresentable},
-                                  protocols);
-            } else {
-              // We need to make a stored rawValue or storage type, and a
-              // computed one of bridged type.
-              makeStructRawValuedWithBridge(
-                  structDecl, storedUnderlyingType,
-                  computedPropertyUnderlyingType,
-                  {KnownProtocolKind::RawRepresentable}, protocols);
-            }
+      if (!SwiftType)
+        if (auto newtypeAttr = Impl.getSwiftNewtypeAttr(Decl, useSwift2Name))
+          if (auto newtype = importSwiftNewtype(Decl, newtypeAttr, DC, Name))
+            return newtype;
 
             Impl.ImportedDecls[Decl->getCanonicalDecl()] = structDecl;
             Impl.registerExternalDecl(structDecl);
@@ -1367,8 +1322,7 @@ namespace {
         SwiftType = Impl.importType(ClangType,
                                     ImportTypeKind::Typedef,
                                     isInSystemModule(DC),
-                                    ClangType->isBlockPointerType(),
-                                    OTK_Optional);
+                                    ClangType->isBlockPointerType());
       }
 
       if (!SwiftType)

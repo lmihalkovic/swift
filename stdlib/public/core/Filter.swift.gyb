@@ -1,4 +1,4 @@
-//===--- Filter.swift.gyb -------------------------------------------------===//
+//===--- Filter.swift.gyb -------------------------------------*- swift -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -348,7 +348,7 @@ extension LazyFilterIterator {
     _ base: Base,
     whereElementsSatisfy predicate: (Base.Element) -> Bool
   ) {
-    Builtin.unreachable()
+    fatalError("unavailable function can't be called")
   }
 }
 
@@ -358,12 +358,12 @@ extension LazyFilterSequence {
     _ base: Base,
     whereElementsSatisfy predicate: (Base.Iterator.Element) -> Bool
   ) {
-    Builtin.unreachable()
+    fatalError("unavailable function can't be called")
   }
 
   @available(*, unavailable, renamed: "makeIterator")
   public func generate() -> LazyFilterIterator<Base.Iterator> {
-    Builtin.unreachable()
+    fatalError("unavailable function can't be called")
   }
 }
 
@@ -373,12 +373,12 @@ extension LazyFilterCollection {
     _ base: Base,
     whereElementsSatisfy predicate: (Base.Iterator.Element) -> Bool
   ) {
-    Builtin.unreachable()
+    fatalError("unavailable function can't be called")
   }
 
   @available(*, unavailable, renamed: "makeIterator")
   public func generate() -> LazyFilterIterator<Base.Iterator> {
-    Builtin.unreachable()
+    fatalError("unavailable function can't be called")
   }
 }
 

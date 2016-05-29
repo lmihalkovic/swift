@@ -1340,10 +1340,11 @@ Type TypeChecker::resolveIdentifierType(
   return result;
 }
 
-// Returns true if any illegal IUOs were found. If inference of IUO type is disabled, IUOs may only be specified in the following positions:
-//  * outermost type
-//  * function param
-//  * function return type
+/// Returns true if any illegal IUOs were found. If inference of IUO type is
+/// disabled, IUOs may only be specified in the following positions:
+///  * outermost type
+///  * function param
+///  * function return type
 static bool checkForIllegalIUOs(TypeChecker &TC, TypeRepr *Repr,
                                 TypeResolutionOptions Options) {
   class IllegalIUOWalker : public ASTWalker {
@@ -1409,9 +1410,6 @@ bool TypeChecker::validateType(TypeLoc &Loc, DeclContext *DC,
     return Loc.isError();
 
   if (Loc.getType().isNull()) {
-    // Raise error if we parse an IUO type in an illegal position.
-    checkForIllegalIUOs(*this, Loc.getTypeRepr(), options);
-
     auto type = resolveType(Loc.getTypeRepr(), DC, options, resolver,
                             unsatisfiedDependency);
     if (!type) {

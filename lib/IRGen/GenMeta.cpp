@@ -1225,6 +1225,11 @@ createInPlaceMetadataInitializationFunction(IRGenModule &IGM,
   if (IGM.DebugInfo)
     IGM.DebugInfo->emitArtificialFunction(IGF, fn);
 
+  // Skip instrumentation when building for TSan to avoid false positives.
+  // The syncronization for this happens in the Runtime and we do not see it.
+  if (IGM.IRGen.Opts.Sanitize == SanitizerKind::Thread)
+    fn->removeFnAttr(llvm::Attribute::SanitizeThread);
+
   // Emit the initialization.
   llvm::Value *relocatedMetadata = initialize(IGF, metadata);
 
@@ -1279,7 +1284,10 @@ emitInPlaceTypeMetadataAccessFunctionBody(IRGenFunction &IGF,
   // We can just load the cache now.
   // TODO: this should be consume-ordered when LLVM supports it.
   Address cacheAddr = Address(cacheVariable, IGF.IGM.getPointerAlignment());
-  llvm::Value *relocatedMetadata = IGF.Builder.CreateLoad(cacheAddr);
+  llvm::LoadInst *relocatedMetadata = IGF.Builder.CreateLoad(cacheAddr);
+  // Make this barrier explicit when building for TSan to avoid false positives.
+  if (IGF.IGM.IRGen.Opts.Sanitize == SanitizerKind::Thread)
+    relocatedMetadata->setOrdering(llvm::AtomicOrdering::Acquire);
 
   // emitLazyCacheAccessFunction will see that the value was loaded from
   // the guard variable and skip the redundant store back.
@@ -2880,6 +2888,12 @@ namespace {
       f->setAttributes(IGM.constructInitialAttributes());
       
       IRGenFunction IGF(IGM, f);
+
+      // Skip instrumentation when building for TSan to avoid false positives.
+      // The syncronization for this happens in the Runtime and we do not see it.
+      if (IGM.IRGen.Opts.Sanitize == SanitizerKind::Thread)
+        f->removeFnAttr(llvm::Attribute::SanitizeThread);
+
       if (IGM.DebugInfo)
         IGM.DebugInfo->emitArtificialFunction(IGF, f);
 
@@ -4324,16 +4338,20 @@ irgen::emitClassResilientInstanceSizeAndAlignMask(IRGenFunction &IGF,
          && "didn't find size or alignment in metadata?!");
   Address metadataAsBytes(IGF.Builder.CreateBitCast(metadata, IGF.IGM.Int8PtrTy),
                           IGF.IGM.getPointerAlignment());
-  auto loadZExtInt32AtOffset = [&](Size offset) {
-    Address slot = IGF.Builder.CreateConstByteArrayGEP(metadataAsBytes, offset);
-    slot = IGF.Builder.CreateBitCast(slot, IGF.IGM.Int32Ty->getPointerTo());
-    llvm::Value *result = IGF.Builder.CreateLoad(slot);
-    if (IGF.IGM.SizeTy != IGF.IGM.Int32Ty)
-      result = IGF.Builder.CreateZExt(result, IGF.IGM.SizeTy);
-    return result;
-  };
-  llvm::Value *size = loadZExtInt32AtOffset(scanner.InstanceSize);
-  llvm::Value *alignMask = loadZExtInt32AtOffset(scanner.InstanceAlignMask);
+
+  Address slot = IGF.Builder.CreateConstByteArrayGEP(metadataAsBytes,
+                                                     scanner.InstanceSize);
+  slot = IGF.Builder.CreateBitCast(slot, IGF.IGM.Int32Ty->getPointerTo());
+  llvm::Value *size = IGF.Builder.CreateLoad(slot);
+  if (IGF.IGM.SizeTy != IGF.IGM.Int32Ty)
+    size = IGF.Builder.CreateZExt(size, IGF.IGM.SizeTy);
+
+  slot = IGF.Builder.CreateConstByteArrayGEP(metadataAsBytes,
+                                             scanner.InstanceAlignMask);
+  slot = IGF.Builder.CreateBitCast(slot, IGF.IGM.Int16Ty->getPointerTo());
+  llvm::Value *alignMask = IGF.Builder.CreateLoad(slot);
+  alignMask = IGF.Builder.CreateZExt(alignMask, IGF.IGM.SizeTy);
+
   return {size, alignMask};
 }
 
@@ -5478,6 +5496,7 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::Comparable:
   case KnownProtocolKind::ObjectiveCBridgeable:
   case KnownProtocolKind::DestructorSafeContainer:
+  case KnownProtocolKind::SwiftNewtypeWrapper:
   case KnownProtocolKind::ArrayLiteralConvertible:
   case KnownProtocolKind::BooleanLiteralConvertible:
   case KnownProtocolKind::DictionaryLiteralConvertible:
@@ -5675,7 +5694,7 @@ void IRGenModule::emitProtocolDecl(ProtocolDecl *protocol) {
   var->setConstant(true);
   var->setInitializer(init);
 
-  emitReflectionMetadata(protocol);
+  emitFieldMetadataRecord(protocol);
 }
 
 /// \brief Load a reference to the protocol descriptor for the given protocol.

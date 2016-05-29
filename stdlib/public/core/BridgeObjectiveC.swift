@@ -194,7 +194,6 @@ func _bridgeToObjectiveCUnconditionalAutorelease<T>(_ x: T) -> AnyObject
   return bridged
 }
 
-@warn_unused_result
 @_silgen_name("_swift_bridgeNonVerbatimToObjectiveC")
 func _bridgeNonVerbatimToObjectiveC<T>(_ x: T) -> AnyObject?
 
@@ -272,7 +271,7 @@ public func _conditionallyBridgeFromObjectiveC_bridgeable<T:_ObjectiveCBridgeabl
   return result
 }
 
-@_silgen_name("_swift_bridgeNonVerbatimFromObjectiveC")
+@_silgen_name("swift_bridgeNonVerbatimFromObjectiveC")
 func _bridgeNonVerbatimFromObjectiveC<T>(
   _ x: AnyObject,
   _ nativeType: T.Type,
@@ -286,7 +285,7 @@ func _bridgeNonVerbatimFromObjectiveC<T>(
 ///   unchanged otherwise.
 ///
 /// - Returns: `true` to indicate success, `false` to indicate failure.
-@_silgen_name("_swift_bridgeNonVerbatimFromObjectiveCConditional")
+@_silgen_name("swift_bridgeNonVerbatimFromObjectiveCConditional")
 func _bridgeNonVerbatimFromObjectiveCConditional<T>(
   _ x: AnyObject,
   _ nativeType: T.Type,
@@ -307,7 +306,6 @@ public func _isBridgedToObjectiveC<T>(_: T.Type) -> Bool {
   return _isBridgedNonVerbatimToObjectiveC(T.self)
 }
 
-@warn_unused_result
 @_silgen_name("_swift_isBridgedNonVerbatimToObjectiveC")
 func _isBridgedNonVerbatimToObjectiveC<T>(_: T.Type) -> Bool
 
@@ -329,7 +327,6 @@ public func _getBridgedObjectiveCType<T>(_: T.Type) -> Any.Type? {
   return _getBridgedNonVerbatimObjectiveCType(T.self)
 }
 
-@warn_unused_result
 @_silgen_name("_swift_getBridgedNonVerbatimObjectiveCType")
 func _getBridgedNonVerbatimObjectiveCType<T>(_: T.Type) -> Any.Type?
 
@@ -530,12 +527,12 @@ extension AutoreleasingUnsafeMutablePointer {
 
   @available(*, unavailable, renamed: "pointee")
   public var memory: Pointee {
-    Builtin.unreachable()
+    fatalError("unavailable function can't be called")
   }
 
   @available(*, unavailable, message: "Removed in Swift 3. Please use nil literal instead.")
   public init() {
-    Builtin.unreachable()
+    fatalError("unavailable function can't be called")
   }
 }
 #endif

@@ -31,6 +31,7 @@
 #include "swift/AST/ReferencedNameTracker.h"
 #include "swift/AST/TypeWalker.h"
 #include "swift/Parse/Lexer.h"
+#include "swift/Parse/Parser.h"
 #include "swift/Sema/IterativeTypeChecker.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Strings.h"
@@ -729,36 +730,6 @@ void TypeChecker::revertGenericParamList(GenericParamList *genericParams) {
   }
 }
 
-static void markInvalidGenericSignature(ValueDecl *VD, TypeChecker &TC) {
-  GenericParamList *genericParams;
-  if (auto *AFD = dyn_cast<AbstractFunctionDecl>(VD))
-    genericParams = AFD->getGenericParams();
-  else
-    genericParams = cast<GenericTypeDecl>(VD)->getGenericParams();
-  
-  // If there aren't any generic parameters at this level, we're done.
-  if (genericParams == nullptr)
-    return;
-
-  DeclContext *DC = VD->getDeclContext();
-  ArchetypeBuilder builder = TC.createArchetypeBuilder(DC->getParentModule());
-
-  if (auto sig = DC->getGenericSignatureOfContext())
-    builder.addGenericSignature(sig, true);
-  
-  // Visit each of the generic parameters.
-  for (auto param : *genericParams)
-    builder.addGenericParameter(param);
-  
-  // Wire up the archetypes.
-  for (auto GP : *genericParams)
-    GP->setArchetype(builder.getArchetype(GP));
-
-  genericParams->setAllArchetypes(
-      TC.Context.AllocateCopy(builder.getAllArchetypes()));
-}
-
-
 /// Finalize the given generic parameter list, assigning archetypes to
 /// the generic parameters.
 static void finalizeGenericParamList(ArchetypeBuilder &builder,
@@ -1298,8 +1269,7 @@ Type swift::configureImplicitSelf(TypeChecker &tc,
 /// the given constructor.
 void swift::configureConstructorType(ConstructorDecl *ctor,
                                      Type selfType,
-                                     Type argType,
-                                     bool throws) {
+                                     Type argType) {
   Type fnType;
   Type allocFnType;
   Type initFnType;
@@ -1308,7 +1278,9 @@ void swift::configureConstructorType(ConstructorDecl *ctor,
     resultType = OptionalType::get(ctor->getFailability(), resultType);
   }
 
-  auto extInfo = AnyFunctionType::ExtInfo().withThrows(throws);
+  AnyFunctionType::ExtInfo extInfo;
+  if (ctor->hasThrows())
+    extInfo = extInfo.withThrows();
 
   GenericParamList *outerGenericParams =
       ctor->getDeclContext()->getGenericParamsOfContext();
@@ -2063,11 +2035,13 @@ static Optional<ObjCReason> shouldMarkAsObjC(TypeChecker &TC,
   // explicitly declared @objc.
   if (VD->getAttrs().hasAttribute<ObjCAttr>())
     return ObjCReason::ExplicitlyObjC;
-  // dynamic, @IBOutlet and @NSManaged imply @objc.
+  // dynamic, @IBOutlet, @IBAction, and @NSManaged imply @objc.
   else if (VD->getAttrs().hasAttribute<DynamicAttr>())
     return ObjCReason::ExplicitlyDynamic;
   else if (VD->getAttrs().hasAttribute<IBOutletAttr>())
     return ObjCReason::ExplicitlyIBOutlet;
+  else if (VD->getAttrs().hasAttribute<IBActionAttr>())
+    return ObjCReason::ExplicitlyIBAction;
   else if (VD->getAttrs().hasAttribute<NSManagedAttr>())
     return ObjCReason::ExplicitlyNSManaged;
   // A member of an @objc protocol is implicitly @objc.
@@ -2295,18 +2269,42 @@ static void inferObjCName(TypeChecker &tc, ValueDecl *decl) {
   // When no override determined the Objective-C name, look for
   // requirements for which this declaration is a witness.
   Optional<ObjCSelector> requirementObjCName;
+  ValueDecl *firstReq = nullptr;
   for (auto req : tc.findWitnessedObjCRequirements(decl,
                                                    /*onlyFirst=*/false)) {
     // If this is the first requirement, take its name.
     if (!requirementObjCName) {
       requirementObjCName = req->getObjCRuntimeName();
+      firstReq = req;
       continue;
     }
 
     // If this requirement has a different name from one we've seen,
-    // bail out and let protocol-conformance diagnostics handle this.
-    if (*requirementObjCName != *req->getObjCRuntimeName())
-      return;
+    // note the ambiguity.
+    if (*requirementObjCName != *req->getObjCRuntimeName()) {
+      tc.diagnose(decl, diag::objc_ambiguous_inference,
+                  decl->getDescriptiveKind(), decl->getFullName(),
+                  *requirementObjCName, *req->getObjCRuntimeName());
+      
+      // Note the candidates and what Objective-C names they provide.
+      auto diagnoseCandidate = [&](ValueDecl *req) {
+        auto proto = cast<ProtocolDecl>(req->getDeclContext());
+        auto diag = tc.diagnose(decl,
+                                diag::objc_ambiguous_inference_candidate,
+                                req->getFullName(),
+                                proto->getFullName(),
+                                *req->getObjCRuntimeName());
+        fixDeclarationObjCName(diag, decl, req->getObjCRuntimeName());
+      };
+      diagnoseCandidate(firstReq);
+      diagnoseCandidate(req);
+
+      // Suggest '@nonobjc' to suppress this error, and not try to
+      // infer @objc for anything.
+      tc.diagnose(decl, diag::optional_req_near_match_nonobjc, true)
+        .fixItInsert(decl->getAttributeInsertionLoc(false), "@nonobjc ");
+      break;
+    }
   }
 
   // If we have a name, install it via an @objc attribute.
@@ -2366,7 +2364,7 @@ void swift::markAsObjC(TypeChecker &TC, ValueDecl *D,
         // adopt it.  Set the foreign error convention for a throwing
         // method.  Note that the foreign error convention affects the
         // selector, so we perform this before inferring a selector.
-        if (method->isBodyThrowing()) {
+        if (method->hasThrows()) {
           if (auto baseErrorConvention
                 = baseMethod->getForeignErrorConvention()) {
             errorConvention = baseErrorConvention;
@@ -2375,7 +2373,7 @@ void swift::markAsObjC(TypeChecker &TC, ValueDecl *D,
           assert(errorConvention && "Missing error convention");
           method->setForeignErrorConvention(*errorConvention);
         }
-      } else if (method->isBodyThrowing()) {
+      } else if (method->hasThrows()) {
         // Attach the foreign error convention.
         assert(errorConvention && "Missing error convention");
         method->setForeignErrorConvention(*errorConvention);
@@ -2413,7 +2411,7 @@ void swift::markAsObjC(TypeChecker &TC, ValueDecl *D,
       inferObjCName(TC, D);
     }
   } else if (auto method = dyn_cast<AbstractFunctionDecl>(D)) {
-    if (method->isBodyThrowing()) {
+    if (method->hasThrows()) {
       // Attach the foreign error convention.
       assert(errorConvention && "Missing error convention");
       method->setForeignErrorConvention(*errorConvention);
@@ -4336,7 +4334,7 @@ public:
       gp->setOuterParameters(FD->getDeclContext()->getGenericParamsOfContext());
 
       if (TC.validateGenericFuncSignature(FD)) {
-        markInvalidGenericSignature(FD, TC);
+        TC.markInvalidGenericSignature(FD);
       } else {
         // Create a fresh archetype builder.
         ArchetypeBuilder builder =
@@ -4363,7 +4361,7 @@ public:
       }
     } else if (FD->getDeclContext()->isGenericTypeContext()) {
       if (TC.validateGenericFuncSignature(FD)) {
-        markInvalidGenericSignature(FD, TC);
+        TC.markInvalidGenericSignature(FD);
       } else if (!FD->hasType()) {
         // Revert all of the types within the signature of the function.
         TC.revertGenericFuncSignature(FD);
@@ -4448,7 +4446,7 @@ public:
       Optional<ForeignErrorConvention> errorConvention;
       if (TC.isRepresentableInObjC(FD, ObjCReason::ExplicitlyCDecl,
                                    errorConvention)) {
-        if (FD->isBodyThrowing()) {
+        if (FD->hasThrows()) {
           FD->setForeignErrorConvention(*errorConvention);
           TC.diagnose(CDeclAttr->getLocation(), diag::cdecl_throws);
         }
@@ -4785,9 +4783,162 @@ public:
       type = fnType->withExtInfo(extInfo);
   }
 
+  /// Attempt to fix the type of \p decl so that it's a valid override for
+  /// \p base...but only if we're highly confident that we know what the user
+  /// should have written.
+  ///
+  /// \returns true iff any fix-its were attached to \p diag.
+  static bool fixOverrideDeclarationTypes(InFlightDiagnostic &diag,
+                                          TypeChecker &TC,
+                                          ValueDecl *decl,
+                                          const ValueDecl *base) {
+    // For now, just rewrite cases where the base uses a value type and the
+    // override uses a reference type, and the value type is bridged to the
+    // reference type. This is a way to migrate code that makes use of types
+    // that previously were not bridged to value types.
+    auto checkType = [&](Type overrideTy, Type baseTy,
+                         SourceRange typeRange) -> bool {
+      if (typeRange.isInvalid())
+        return false;
+
+      auto normalizeType = [](Type ty) -> Type {
+        ty = ty->getInOutObjectType();
+        if (Type unwrappedTy = ty->getAnyOptionalObjectType())
+          ty = unwrappedTy;
+        return ty;
+      };
+
+      // Is the base type bridged?
+      Type normalizedBaseTy = normalizeType(baseTy);
+      const DeclContext *DC = decl->getDeclContext();
+      Optional<Type> maybeBridged =
+          TC.Context.getBridgedToObjC(DC, normalizedBaseTy, &TC);
+
+      // ...and just knowing that it's bridged isn't good enough if we don't
+      // know what it's bridged /to/. Also, don't do this check for trivial
+      // bridging---that doesn't count.
+      Type bridged = maybeBridged.getValueOr(Type());
+      if (!bridged || bridged->isEqual(normalizedBaseTy))
+        return false;
+
+      // ...and is it bridged to the overridden type?
+      Type normalizedOverrideTy = normalizeType(overrideTy);
+      if (!bridged->isEqual(normalizedOverrideTy)) {
+        // If both are nominal types, check again, ignoring generic arguments.
+        auto *overrideNominal = normalizedOverrideTy->getAnyNominal();
+        if (!overrideNominal || bridged->getAnyNominal() != overrideNominal) {
+          return false;
+        }
+      }
+
+      Type newOverrideTy = baseTy;
+
+      // Preserve optionality if we're dealing with a simple type.
+      OptionalTypeKind OTK;
+      if (Type unwrappedTy = newOverrideTy->getAnyOptionalObjectType())
+        newOverrideTy = unwrappedTy;
+      if (overrideTy->getAnyOptionalObjectType(OTK))
+        newOverrideTy = OptionalType::get(OTK, newOverrideTy);
+
+      SmallString<32> baseTypeBuf;
+      llvm::raw_svector_ostream baseTypeStr(baseTypeBuf);
+      PrintOptions options;
+      options.SynthesizeSugarOnTypes = true;
+
+      newOverrideTy->print(baseTypeStr, options);
+      diag.fixItReplace(typeRange, baseTypeStr.str());
+      return true;
+    };
+
+    if (auto *var = dyn_cast<VarDecl>(decl)) {
+      SourceRange typeRange = var->getTypeSourceRangeForDiagnostics();
+      return checkType(var->getType(), base->getType(), typeRange);
+    }
+
+    if (auto *fn = dyn_cast<AbstractFunctionDecl>(decl)) {
+      auto *baseFn = cast<AbstractFunctionDecl>(base);
+      bool fixedAny = false;
+      if (fn->getParameterLists().back()->size() ==
+          baseFn->getParameterLists().back()->size()) {
+        for_each(*fn->getParameterLists().back(),
+                 *baseFn->getParameterLists().back(),
+                 [&](ParamDecl *param, const ParamDecl *baseParam) {
+          fixedAny |= fixOverrideDeclarationTypes(diag, TC, param, baseParam);
+        });
+      }
+      if (auto *method = dyn_cast<FuncDecl>(decl)) {
+        auto *baseMethod = cast<FuncDecl>(base);
+        fixedAny |= checkType(method->getBodyResultType(),
+                              baseMethod->getBodyResultType(),
+                              method->getBodyResultTypeLoc().getSourceRange());
+      }
+      return fixedAny;
+    }
+
+    if (auto *subscript = dyn_cast<SubscriptDecl>(decl)) {
+      auto *baseSubscript = cast<SubscriptDecl>(base);
+      bool fixedAny = false;
+      for_each(*subscript->getIndices(),
+               *baseSubscript->getIndices(),
+               [&](ParamDecl *param, const ParamDecl *baseParam) {
+        fixedAny |= fixOverrideDeclarationTypes(diag, TC, param, baseParam);
+      });
+      fixedAny |= checkType(subscript->getElementType(),
+                            baseSubscript->getElementType(),
+                            subscript->getElementTypeLoc().getSourceRange());
+      return fixedAny;
+    }
+
+    llvm_unreachable("unknown overridable member");
+  }
+
+  /// If the difference between the types of \p decl and \p base is something
+  /// we feel confident about fixing (even partially), emit a note with fix-its
+  /// attached. Otherwise, no note will be emitted.
+  ///
+  /// \returns true iff a diagnostic was emitted.
+  static bool noteFixableMismatchedTypes(TypeChecker &TC, ValueDecl *decl,
+                                         const ValueDecl *base) {
+    DiagnosticTransaction tentativeDiags(TC.Diags);
+
+    {
+      Type baseTy = base->getType();
+      if (baseTy->is<ErrorType>())
+        return false;
+
+      Optional<InFlightDiagnostic> activeDiag;
+      if (auto *baseInit = dyn_cast<ConstructorDecl>(base)) {
+        // Special-case initializers, whose "type" isn't useful besides the
+        // input arguments.
+        baseTy = baseTy->getAs<AnyFunctionType>()->getResult();
+        Type argTy = baseTy->getAs<AnyFunctionType>()->getInput();
+        auto diagKind = diag::override_type_mismatch_with_fixits_init;
+        unsigned numArgs = baseInit->getParameters()->size();
+        activeDiag.emplace(TC.diagnose(decl, diagKind,
+                                       /*plural*/std::min(numArgs, 2U),
+                                       argTy));
+      } else {
+        if (isa<AbstractFunctionDecl>(base))
+          baseTy = baseTy->getAs<AnyFunctionType>()->getResult();
+
+        activeDiag.emplace(TC.diagnose(decl,
+                                       diag::override_type_mismatch_with_fixits,
+                                       base->getDescriptiveKind(), baseTy));
+      }
+
+      if (fixOverrideDeclarationTypes(*activeDiag, TC, decl, base))
+        return true;
+    }
+
+    // There weren't any fixes we knew how to make. Drop this diagnostic.
+    tentativeDiags.abort();
+    return false;
+  }
+
   enum class OverrideCheckingAttempt {
     PerfectMatch,
     MismatchedOptional,
+    MismatchedTypes,
     BaseName,
     BaseNameWithMismatchedOptional,
     Final
@@ -4819,6 +4970,7 @@ public:
                   decl->getFullName());
       break;
     case OverrideCheckingAttempt::MismatchedOptional:
+    case OverrideCheckingAttempt::MismatchedTypes:
     case OverrideCheckingAttempt::BaseNameWithMismatchedOptional:
       if (isa<ConstructorDecl>(decl))
         TC.diagnose(decl, diag::initializer_does_not_override);
@@ -4909,6 +5061,7 @@ public:
     auto superclassMetaTy = MetatypeType::get(superclass);
     DeclName name = decl->getFullName();
     bool hadExactMatch = false;
+    LookupResult members;
 
     do {
       switch (attempt) {
@@ -4919,12 +5072,15 @@ public:
         if (!decl->getAttrs().hasAttribute<OverrideAttr>())
           return false;
         break;
+      case OverrideCheckingAttempt::MismatchedTypes:
+        break;
       case OverrideCheckingAttempt::BaseName:
         // Don't keep looking if this is already a simple name, or if there
         // are no arguments.
         if (name.isSimpleName() || name.getArgumentNames().empty())
           return false;
         name = name.getBaseName();
+        members.clear();
         break;
       case OverrideCheckingAttempt::BaseNameWithMismatchedOptional:
         break;
@@ -4933,11 +5089,12 @@ public:
         return false;
       }
 
-      NameLookupOptions lookupOptions
-        = defaultMemberLookupOptions - NameLookupFlags::DynamicLookup;
-      LookupResult members = TC.lookupMember(decl->getDeclContext(),
-                                             superclassMetaTy, name,
-                                             lookupOptions);
+      if (members.empty()) {
+        NameLookupOptions lookupOptions =
+            defaultMemberLookupOptions - NameLookupFlags::DynamicLookup;
+        members = TC.lookupMember(decl->getDeclContext(), superclassMetaTy,
+                                  name, lookupOptions);
+      }
 
       for (auto memberResult : members) {
         auto member = memberResult.Decl;
@@ -5014,7 +5171,8 @@ public:
         // If this is a property, we accept the match and then reject it below
         // if the types don't line up, since you can't overload properties based
         // on types.
-        if (isa<VarDecl>(parentDecl)) {
+        if (isa<VarDecl>(parentDecl) ||
+            attempt == OverrideCheckingAttempt::MismatchedTypes) {
           matches.push_back({parentDecl, false, parentDeclTy});
           continue;
         }
@@ -5150,9 +5308,21 @@ public:
         // Nothing to do.
         
       } else if (method) {
-        // Private migration help for overrides of Objective-C methods.
-        if ((!isa<FuncDecl>(method) || !cast<FuncDecl>(method)->isAccessor()) &&
-            (matchDecl->isObjC() || mayHaveMismatchedOptionals)) {
+        if (attempt == OverrideCheckingAttempt::MismatchedTypes) {
+          auto diagKind = diag::method_does_not_override;
+          if (ctor)
+            diagKind = diag::initializer_does_not_override;
+          TC.diagnose(decl, diagKind);
+          noteFixableMismatchedTypes(TC, decl, matchDecl);
+          TC.diagnose(matchDecl, diag::overridden_near_match_here,
+                      matchDecl->getDescriptiveKind(),
+                      matchDecl->getFullName());
+          emittedMatchError = true;
+
+        } else if ((!isa<FuncDecl>(method) ||
+                    !cast<FuncDecl>(method)->isAccessor()) &&
+                   (matchDecl->isObjC() || mayHaveMismatchedOptionals)) {
+          // Private migration help for overrides of Objective-C methods.
           TypeLoc resultTL;
           if (auto *methodAsFunc = dyn_cast<FuncDecl>(method))
             resultTL = methodAsFunc->getBodyResultTypeLoc();
@@ -5174,7 +5344,15 @@ public:
           return true;
         }
 
-        if (mayHaveMismatchedOptionals) {
+        if (attempt == OverrideCheckingAttempt::MismatchedTypes) {
+          TC.diagnose(decl, diag::subscript_does_not_override);
+          noteFixableMismatchedTypes(TC, decl, matchDecl);
+          TC.diagnose(matchDecl, diag::overridden_near_match_here,
+                      matchDecl->getDescriptiveKind(),
+                      matchDecl->getFullName());
+          emittedMatchError = true;
+
+        } else if (mayHaveMismatchedOptionals) {
           emittedMatchError |=
               diagnoseMismatchedOptionals(TC, subscript,
                                           subscript->getIndices(),
@@ -5192,6 +5370,7 @@ public:
                                      &TC)) {
           TC.diagnose(property, diag::override_property_type_mismatch,
                       property->getName(), propertyTy, parentPropertyTy);
+          noteFixableMismatchedTypes(TC, decl, matchDecl);
           TC.diagnose(matchDecl, diag::property_override_here);
           return true;
         }
@@ -5322,7 +5501,7 @@ public:
       // Require 'rethrows' on the override if it was there on the base,
       // unless the override is completely non-throwing.
       if (!Override->getAttrs().hasAttribute<RethrowsAttr>() &&
-          cast<AbstractFunctionDecl>(Override)->isBodyThrowing()) {
+          cast<AbstractFunctionDecl>(Override)->hasThrows()) {
         TC.diagnose(Override, diag::override_rethrows_with_non_rethrows,
                     isa<ConstructorDecl>(Override));
         TC.diagnose(Base, diag::overridden_here);
@@ -5564,15 +5743,15 @@ public:
     // If the overriding declaration is 'throws' but the base is not,
     // complain.
     if (auto overrideFn = dyn_cast<AbstractFunctionDecl>(override)) {
-      if (overrideFn->isBodyThrowing() &&
-          !cast<AbstractFunctionDecl>(base)->isBodyThrowing()) {
+      if (overrideFn->hasThrows() &&
+          !cast<AbstractFunctionDecl>(base)->hasThrows()) {
         TC.diagnose(override, diag::override_throws,
                     isa<ConstructorDecl>(override));
         TC.diagnose(base, diag::overridden_here);
       }
 
-      if (!overrideFn->isBodyThrowing() && base->isObjC() &&
-          cast<AbstractFunctionDecl>(base)->isBodyThrowing()) {
+      if (!overrideFn->hasThrows() && base->isObjC() &&
+          cast<AbstractFunctionDecl>(base)->hasThrows()) {
         TC.diagnose(override, diag::override_throws_objc,
                     isa<ConstructorDecl>(override));
         TC.diagnose(base, diag::overridden_here);
@@ -5580,8 +5759,8 @@ public:
     }
 
     // FIXME: Possibly should extend to more availability checking.
-    if (base->getAttrs().isUnavailable(TC.Context)) {
-      TC.diagnose(override, diag::override_unavailable, override->getName());
+    if (auto *attr = base->getAttrs().getUnavailable(TC.Context)) {
+      TC.diagnoseUnavailableOverride(override, base, attr);
     }
     
     if (!TC.getLangOpts().DisableAvailabilityChecking) {
@@ -5902,7 +6081,7 @@ public:
       gp->setOuterParameters(CD->getDeclContext()->getGenericParamsOfContext());
 
       if (TC.validateGenericFuncSignature(CD)) {
-        markInvalidGenericSignature(CD, TC);
+        TC.markInvalidGenericSignature(CD);
       } else {
         ArchetypeBuilder builder =
           TC.createArchetypeBuilder(CD->getModuleContext());
@@ -5921,7 +6100,7 @@ public:
       }
     } else if (CD->getDeclContext()->isGenericTypeContext()) {
       if (TC.validateGenericFuncSignature(CD)) {
-        CD->setInvalid();
+        TC.markInvalidGenericSignature(CD);
       } else {
         // Revert all of the types within the signature of the constructor.
         TC.revertGenericFuncSignature(CD);
@@ -5934,8 +6113,7 @@ public:
       CD->setInvalid();
     } else {
       configureConstructorType(CD, SelfTy,
-                               CD->getParameterList(1)->getType(TC.Context),
-                               CD->getThrowsLoc().isValid());
+                               CD->getParameterList(1)->getType(TC.Context));
     }
 
     validateAttributes(TC, CD);
@@ -6474,7 +6652,7 @@ void TypeChecker::validateDecl(ValueDecl *D, bool resolveTypeParams) {
 
       // Validate the generic type parameters.
       if (validateGenericTypeSignature(typeAlias)) {
-        markInvalidGenericSignature(typeAlias, *this);
+        markInvalidGenericSignature(typeAlias);
         return;
       }
       
@@ -6512,7 +6690,7 @@ void TypeChecker::validateDecl(ValueDecl *D, bool resolveTypeParams) {
 
       // Validate the generic type parameters.
       if (validateGenericTypeSignature(nominal)) {
-        markInvalidGenericSignature(nominal, *this);
+        markInvalidGenericSignature(nominal);
         return;
       }
 
@@ -7467,8 +7645,7 @@ void TypeChecker::addImplicitConstructors(NominalTypeDecl *decl) {
          classDecl->getSuperclass()->getAnyNominal()->isInvalid() ||
          classDecl->getSuperclass()->getAnyNominal()
            ->addedImplicitInitializers());
-  if (classDecl->hasSuperclass() && !classDecl->isGenericContext() &&
-      !classDecl->getSuperclass()->isSpecialized()) {
+  if (classDecl->hasSuperclass()) {
     bool canInheritInitializers = !FoundDesignatedInit;
 
     // We can't define these overrides if we have any uninitialized
@@ -7751,7 +7928,7 @@ static void validateAttributes(TypeChecker &TC, Decl *D) {
             numParameters = 0;  // Something like "init(foo: ())"
 
         // A throwing method has an error parameter.
-        if (func->isBodyThrowing())
+        if (func->hasThrows())
           ++numParameters;
 
         unsigned numArgumentNames = objcName->getNumArgs();
@@ -7763,7 +7940,7 @@ static void validateAttributes(TypeChecker &TC, Decl *D) {
                       numArgumentNames != 1,
                       numParameters,
                       numParameters != 1,
-                      func->isBodyThrowing());
+                      func->hasThrows());
           D->getAttrs().add(
             ObjCAttr::createUnnamed(TC.Context,
                                     objcAttr->AtLoc,
@@ -7816,6 +7993,14 @@ static void validateAttributes(TypeChecker &TC, Decl *D) {
       TC.diagnose(OA->getLocation(),
                   diag::optional_attribute_initializer);
       D->getAttrs().removeAttribute(OA);
+    } else {
+      auto objcAttr = D->getAttrs().getAttribute<ObjCAttr>();
+      if (!objcAttr || objcAttr->isImplicit()) {
+        auto diag = TC.diagnose(OA->getLocation(),
+                                diag::optional_attribute_missing_explicit_objc);
+        if (auto VD = dyn_cast<ValueDecl>(D))
+          diag.fixItInsert(VD->getAttributeInsertionLoc(false), "@objc ");
+      }
     }
   }
 

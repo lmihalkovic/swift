@@ -769,13 +769,12 @@ llvm::Constant *IRGenModule::getAddrOfStringForTypeRef(StringRef Str) {
   return entry.second;
 }
 
-llvm::Constant *IRGenModule::getAddrOfCaptureDescriptor(SILFunction &SILFn,
-                                                        HeapLayout &Layout) {
+llvm::Constant *
+IRGenModule::getAddrOfBoxDescriptor(CanType BoxedType) {
   if (!IRGen.Opts.EnableReflectionMetadata)
     return llvm::Constant::getNullValue(CaptureDescriptorPtrTy);
 
-  llvm::SetVector<CanType> BuiltinTypes;
-  CaptureDescriptorBuilder builder(*this, BuiltinTypes, SILFn, Layout);
+  BoxDescriptorBuilder builder(*this, BoxedType);
 
   auto var = builder.emit();
   if (var)

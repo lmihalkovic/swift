@@ -31,10 +31,11 @@
 // PRINT-NEXT:    static let secondEntry: ClosedEnum
 // PRINT-NEXT:    static let thirdEntry: ClosedEnum
 // PRINT-NEXT:  }
-// PRINT-NEXT:  struct IUONewtype : RawRepresentable {
-// PRINT-NEXT:    init(rawValue: String?)
-// PRINT-NEXT:    var _rawValue: NSString?
-// PRINT-NEXT:    var rawValue: String? { get }
+// PRINT-NEXT:  struct IUONewtype : RawRepresentable, _SwiftNewtypeWrapper, Equatable, Hashable, Comparable, _ObjectiveCBridgeable {
+// PRINT-NEXT:    init(_ rawValue: String)
+// PRINT-NEXT:    init(rawValue: String)
+// PRINT-NEXT:    var _rawValue: NSString
+// PRINT-NEXT:    var rawValue: String { get }
 // PRINT-NEXT:  }
 // PRINT-NEXT:  struct MyFloat : RawRepresentable {
 // PRINT-NEXT:    init(rawValue: Float)

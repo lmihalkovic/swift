@@ -14,21 +14,47 @@
 #
 # ----------------------------------------------------------------------------
 
+from __future__ import absolute_import
+
 import subprocess
 
+from . import cache_util
 
-def find(toolchain, tool):
+
+@cache_util.cached
+def find(tool, sdk=None, toolchain=None):
     """
     Return the path for the given tool, according to `xcrun --find`, using
-    the given toolchain. If `xcrun --find` cannot find the tool, return None.
+    the given sdk and toolchain.
+
+    If `xcrun --find` cannot find the tool, return None.
     """
+    command = ['xcrun', '--find', tool]
+    if sdk is not None:
+        command += ['--sdk', sdk]
+    if toolchain is not None:
+        command += ['--toolchain', toolchain]
+
     try:
         # `xcrun --find` prints to stderr when it fails to find the
         # given tool. We swallow that output with a pipe.
-        out = subprocess.check_output(['xcrun', '--sdk', 'macosx',
-                                       '--toolchain', toolchain,
-                                       '--find', tool],
+        out = subprocess.check_output(command,
                                       stderr=subprocess.PIPE)
-        return out.rstrip().decode()
+        return str(out.rstrip().decode())
+    except subprocess.CalledProcessError:
+        return None
+
+
+@cache_util.cached
+def sdk_path(sdk):
+    """
+    Return the path string for given SDK, according to `xcrun --show-sdk-path`.
+
+    If `xcrun --show-sdk-path` cannot find the SDK, return None.
+    """
+    command = ['xcrun', '--sdk', sdk, '--show-sdk-path']
+    try:
+        out = subprocess.check_output(command)
+        return str(out.rstrip().decode())
     except subprocess.CalledProcessError:
         return None

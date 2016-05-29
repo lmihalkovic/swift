@@ -1736,6 +1736,42 @@ Optional<ObjCSelector> ValueDecl::getObjCRuntimeName() const {
   return None;
 }
 
+bool ValueDecl::canInferObjCFromRequirement(ValueDecl *requirement) {
+  // Only makes sense for a requirement of an @objc protocol.
+  auto proto = cast<ProtocolDecl>(requirement->getDeclContext());
+  if (!proto->isObjC()) return false;
+
+  // Only makes sense when this declaration is within a nominal type
+  // or extension thereof.
+  auto nominal =
+    getDeclContext()->getAsNominalTypeOrNominalTypeExtensionContext();
+  if (!nominal) return false;
+
+  // If there is already an @objc attribute with an explicit name, we
+  // can't infer a name (it's already there).
+  if (auto objcAttr = getAttrs().getAttribute<ObjCAttr>()) {
+    if (!objcAttr->isNameImplicit()) return false;
+  }
+
+  // If the nominal type doesn't conform to the protocol at all, we
+  // cannot infer @objc no matter what we do.
+  SmallVector<ProtocolConformance *, 1> conformances;
+  if (!nominal->lookupConformance(getModuleContext(), proto, conformances))
+    return false;
+
+  // If any of the conformances is attributed to the context in which
+  // this declaration resides, we can infer @objc or the Objective-C
+  // name.
+  auto dc = getDeclContext();
+  for (auto conformance : conformances) {
+    if (conformance->getDeclContext() == dc)
+      return true;
+  }
+
+  // Nothing to infer from.
+  return false;
+}
+
 SourceLoc ValueDecl::getAttributeInsertionLoc(bool forModifier) const {
   if (auto var = dyn_cast<VarDecl>(this)) {
     if (auto pbd = var->getParentPatternBinding()) {
@@ -3333,13 +3369,14 @@ SourceRange VarDecl::getTypeSourceRangeForDiagnostics() const {
   
   Pattern *Pat = getParentPattern();
   if (!Pat || Pat->isImplicit())
-    return getSourceRange();
+    return SourceRange();
 
   if (auto *VP = dyn_cast<VarPattern>(Pat))
     Pat = VP->getSubPattern();
   if (auto *TP = dyn_cast<TypedPattern>(Pat))
     return TP->getTypeLoc().getTypeRepr()->getSourceRange();
-  return getSourceRange();
+
+  return SourceRange();
 }
 
 static bool isVarInPattern(const VarDecl *VD, Pattern *P) {
@@ -3594,9 +3631,11 @@ static Type getSelfTypeOfContext(DeclContext *dc) {
 /// Note that this decl is created, but it is returned with an incorrect
 /// DeclContext that needs to be set correctly.  This is automatically handled
 /// when a function is created with this as part of its argument list.
-///
-ParamDecl *ParamDecl::createSelf(SourceLoc loc, DeclContext *DC,
-                                 bool isStaticMethod, bool isInOut) {
+/// For a generic context, this also gives the parameter an unbound generic
+/// type with the expectation that type-checking will fill in the context
+/// generic parameters.
+ParamDecl *ParamDecl::createUnboundSelf(SourceLoc loc, DeclContext *DC,
+                                        bool isStaticMethod, bool isInOut) {
   ASTContext &C = DC->getASTContext();
   auto selfType = getSelfTypeOfContext(DC);
 
@@ -3613,6 +3652,37 @@ ParamDecl *ParamDecl::createSelf(SourceLoc loc, DeclContext *DC,
   auto *selfDecl = new (C) ParamDecl(/*IsLet*/!isInOut, SourceLoc(),SourceLoc(),
                                      Identifier(), loc, C.Id_self, selfType,DC);
   selfDecl->setImplicit();
+  return selfDecl;
+}
+
+/// Create an implicit 'self' decl for a method in the specified decl context.
+/// If 'static' is true, then this is self for a static method in the type.
+///
+/// Note that this decl is created, but it is returned with an incorrect
+/// DeclContext that needs to be set correctly.  This is automatically handled
+/// when a function is created with this as part of its argument list.
+/// For a generic context, this also gives the parameter an unbound generic
+/// type with the expectation that type-checking will fill in the context
+/// generic parameters.
+ParamDecl *ParamDecl::createSelf(SourceLoc loc, DeclContext *DC,
+                                 bool isStaticMethod, bool isInOut) {
+  ASTContext &C = DC->getASTContext();
+  auto selfType = DC->getSelfTypeInContext();
+
+  // If we have a selfType (i.e. we're not in the parser before we know such
+  // things, configure it.
+  if (selfType) {
+    if (isStaticMethod)
+      selfType = MetatypeType::get(selfType);
+    
+    if (isInOut)
+      selfType = InOutType::get(selfType);
+  }
+    
+  auto *selfDecl = new (C) ParamDecl(/*IsLet*/!isInOut, SourceLoc(),SourceLoc(),
+                                     Identifier(), loc, C.Id_self, selfType,DC);
+  selfDecl->setImplicit();
+  selfDecl->setInterfaceType(DC->getSelfInterfaceType());
   return selfDecl;
 }
 
@@ -4121,10 +4191,10 @@ FuncDecl *FuncDecl::createImpl(ASTContext &Context,
                                StaticSpellingKind StaticSpelling,
                                SourceLoc FuncLoc,
                                DeclName Name, SourceLoc NameLoc,
-                               SourceLoc ThrowsLoc,
+                               bool Throws, SourceLoc ThrowsLoc,
                                SourceLoc AccessorKeywordLoc,
                                GenericParamList *GenericParams,
-                               Type Ty, unsigned NumParamPatterns,
+                               unsigned NumParamPatterns, Type Ty,
                                DeclContext *Parent,
                                ClangNode ClangN) {
   assert(NumParamPatterns > 0);
@@ -4132,8 +4202,10 @@ FuncDecl *FuncDecl::createImpl(ASTContext &Context,
   void *DeclPtr = allocateMemoryForDecl<FuncDecl>(Context, Size,
                                                   !ClangN.isNull());
   auto D = ::new (DeclPtr)
-      FuncDecl(StaticLoc, StaticSpelling, FuncLoc, Name, NameLoc, ThrowsLoc,
-               AccessorKeywordLoc, NumParamPatterns, GenericParams, Ty, Parent);
+      FuncDecl(StaticLoc, StaticSpelling, FuncLoc,
+               Name, NameLoc, Throws, ThrowsLoc,
+               AccessorKeywordLoc, NumParamPatterns,
+               GenericParams, Ty, Parent);
   if (ClangN)
     D->setClangNode(ClangN);
   return D;
@@ -4144,29 +4216,34 @@ FuncDecl *FuncDecl::createDeserialized(ASTContext &Context,
                                        StaticSpellingKind StaticSpelling,
                                        SourceLoc FuncLoc,
                                        DeclName Name, SourceLoc NameLoc,
-                                       SourceLoc ThrowsLoc,
+                                       bool Throws, SourceLoc ThrowsLoc,
                                        SourceLoc AccessorKeywordLoc,
                                        GenericParamList *GenericParams,
-                                       Type Ty, unsigned NumParamPatterns,
+                                       unsigned NumParamPatterns, Type Ty,
                                        DeclContext *Parent) {
-  return createImpl(Context, StaticLoc, StaticSpelling, FuncLoc, Name, NameLoc,
-                    ThrowsLoc, AccessorKeywordLoc, GenericParams, Ty,
-                    NumParamPatterns, Parent, ClangNode());
+  return createImpl(Context, StaticLoc, StaticSpelling, FuncLoc,
+                    Name, NameLoc, Throws, ThrowsLoc,
+                    AccessorKeywordLoc, GenericParams,
+                    NumParamPatterns, Ty, Parent,
+                    ClangNode());
 }
 
 FuncDecl *FuncDecl::create(ASTContext &Context, SourceLoc StaticLoc,
                            StaticSpellingKind StaticSpelling,
-                           SourceLoc FuncLoc, DeclName Name,
-                           SourceLoc NameLoc, SourceLoc ThrowsLoc,
+                           SourceLoc FuncLoc,
+                           DeclName Name, SourceLoc NameLoc,
+                           bool Throws, SourceLoc ThrowsLoc,
                            SourceLoc AccessorKeywordLoc,
                            GenericParamList *GenericParams,
-                           Type Ty, ArrayRef<ParameterList*> BodyParams,
+                           ArrayRef<ParameterList*> BodyParams, Type Ty,
                            TypeLoc FnRetType, DeclContext *Parent,
                            ClangNode ClangN) {
   const unsigned NumParamPatterns = BodyParams.size();
   auto *FD = FuncDecl::createImpl(
-      Context, StaticLoc, StaticSpelling, FuncLoc, Name, NameLoc, ThrowsLoc,
-      AccessorKeywordLoc, GenericParams, Ty, NumParamPatterns, Parent, ClangN);
+      Context, StaticLoc, StaticSpelling, FuncLoc,
+      Name, NameLoc, Throws, ThrowsLoc,
+      AccessorKeywordLoc, GenericParams,
+      NumParamPatterns, Ty, Parent, ClangN);
   FD->setDeserializedSignature(BodyParams, FnRetType);
   return FD;
 }
@@ -4228,21 +4305,6 @@ Type FuncDecl::getResultType() const {
   return resultTy;
 }
 
-bool AbstractFunctionDecl::isBodyThrowing() const {
-  if (!hasType())
-    return false;
-
-  Type type = getType();
-  if (type->is<ErrorType>())
-    return false;
-
-  auto fnTy = type->castTo<AnyFunctionType>();
-  for (unsigned i = 1, e = getNaturalArgumentCount(); i != e; ++i)
-    fnTy = fnTy->getResult()->castTo<AnyFunctionType>();
-
-  return fnTy->getExtInfo().throws();
-}
-
 bool FuncDecl::isUnaryOperator() const {
   if (!isOperator())
     return false;
@@ -4268,16 +4330,18 @@ bool FuncDecl::isBinaryOperator() const {
 ConstructorDecl::ConstructorDecl(DeclName Name, SourceLoc ConstructorLoc,
                                  OptionalTypeKind Failability, 
                                  SourceLoc FailabilityLoc,
-                                 ParamDecl *selfDecl,
+                                 bool Throws,
+                                 SourceLoc ThrowsLoc,
+                                 ParamDecl *SelfDecl,
                                  ParameterList *BodyParams,
                                  GenericParamList *GenericParams,
-                                 SourceLoc throwsLoc,
                                  DeclContext *Parent)
-  : AbstractFunctionDecl(DeclKind::Constructor, Parent, Name,
-                         ConstructorLoc, 2, GenericParams),
-    FailabilityLoc(FailabilityLoc), ThrowsLoc(throwsLoc)
+  : AbstractFunctionDecl(DeclKind::Constructor, Parent, Name, ConstructorLoc,
+                         Throws, ThrowsLoc, /*NumParameterLists=*/2,
+                         GenericParams),
+    FailabilityLoc(FailabilityLoc)
 {
-  setParameterLists(selfDecl, BodyParams);
+  setParameterLists(SelfDecl, BodyParams);
   
   ConstructorDeclBits.ComputedBodyInitKind = 0;
   ConstructorDeclBits.InitKind
@@ -4319,8 +4383,9 @@ bool ConstructorDecl::isObjCZeroParameterWithLongSelector() const {
 
 DestructorDecl::DestructorDecl(Identifier NameHack, SourceLoc DestructorLoc,
                                ParamDecl *selfDecl, DeclContext *Parent)
-  : AbstractFunctionDecl(DeclKind::Destructor, Parent, NameHack,
-                         DestructorLoc, 1, nullptr) {
+  : AbstractFunctionDecl(DeclKind::Destructor, Parent, NameHack, DestructorLoc,
+                         /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                         /*NumParameterLists=*/1, nullptr) {
   setSelfDecl(selfDecl);
 }
 
@@ -4654,4 +4719,32 @@ void InfixOperatorDecl::collectOperatorKeywordRanges(SmallVectorImpl
 
 bool FuncDecl::isDeferBody() const {
   return getName() == getASTContext().getIdentifier("$defer");
+}
+
+Type TypeBase::getSwiftNewtypeUnderlyingType() {
+  auto structDecl = getStructOrBoundGenericStruct();
+  if (!structDecl)
+    return {};
+
+  // Make sure the clang node has swift_newtype attribute
+  if (!structDecl->getClangNode())
+    return {};
+  auto clangNode = structDecl->getClangNode();
+  if (!clangNode.getAsDecl() ||
+      !clangNode.castAsDecl()->getAttr<clang::SwiftNewtypeAttr>())
+    return {};
+
+  // Underlying type is the type of rawValue
+  for (auto member : structDecl->getMembers())
+    if (auto varDecl = dyn_cast<VarDecl>(member))
+      if (varDecl->getName().str() == "rawValue")
+        return varDecl->getType();
+
+  return {};
+}
+
+ClassDecl *ClassDecl::getSuperclassDecl() const {
+  if (auto superclass = getSuperclass())
+    return superclass->getClassOrBoundGenericClass();
+    return nullptr;
 }

@@ -2296,25 +2296,16 @@ RValue RValueEmitter::visitRebindSelfInConstructorExpr(
 static bool isNullableTypeInC(SILModule &M, Type ty) {
   ty = ty->getLValueOrInOutObjectType()->getReferenceStorageReferent();
 
+  // Functions, class instances, and @objc existentials are all nullable.
   if (ty->hasReferenceSemantics())
     return true;
-  
-  auto &C = ty->getASTContext();
-  auto nom = ty->getAnyNominal();
-  if (!nom)
-    return false;
 
-  if (nom == C.getUnsafePointerDecl()
-      || nom == C.getUnsafeMutablePointerDecl()
-      || nom == C.getAutoreleasingUnsafeMutablePointerDecl()
-      || nom == C.getOpaquePointerDecl())
-    return true;
-  
-  auto selectorTy = M.Types.getSelectorType();
-  if (selectorTy && ty->isEqual(selectorTy))
-    return true;
-  
-  return false;
+  // Other types like UnsafePointer can also be nullable.
+  const DeclContext *DC = M.getAssociatedContext();
+  if (!DC)
+    DC = M.getSwiftModule();
+  ty = OptionalType::get(ty);
+  return ty->isTriviallyRepresentableIn(ForeignLanguage::C, DC);
 }
 
 /// Determine whether the given declaration returns a non-optional object that
@@ -2327,8 +2318,7 @@ static bool isNullableTypeInC(SILModule &M, Type ty) {
 ///     that it returns a non-optional object
 ///   - an Objective-C property might be annotated to state (incorrectly) that
 ///     it is non-optional
-static bool mayLieAboutNonOptionalReturn(SILModule &M,
-                                         ValueDecl *decl) {
+static bool mayLieAboutNonOptionalReturn(ValueDecl *decl) {
   // Any Objective-C initializer, because failure propagates from any
   // initializer written in Objective-C (and there's no way to tell).
   if (auto constructor = dyn_cast<ConstructorDecl>(decl)) {
@@ -2338,28 +2328,22 @@ static bool mayLieAboutNonOptionalReturn(SILModule &M,
   // Functions that return non-optional reference type and were imported from
   // Objective-C.
   if (auto func = dyn_cast<FuncDecl>(decl)) {
-    assert((isNullableTypeInC(M, func->getResultType())
-            || func->getResultType()->hasArchetype())
-           && "func's result type is not nullable?!");
-    return func->hasClangNode();
+    return func->hasClangNode() &&
+           func->getResultType()->hasReferenceSemantics();
   }
 
-  // Computed properties of non-optional reference type that were imported from
+  // Properties of non-optional reference type that were imported from
   // Objective-C.
   if (auto var = dyn_cast<VarDecl>(decl)) {
-    assert((isNullableTypeInC(M, var->getType()->getReferenceStorageReferent())
-            || var->getType()->getReferenceStorageReferent()->hasArchetype())
-           && "property's result type is not nullable?!");
-    return var->hasClangNode();
+    return var->hasClangNode() && 
+      var->getType()->getReferenceStorageReferent()->hasReferenceSemantics();
   }
 
   // Subscripts of non-optional reference type that were imported from
   // Objective-C.
   if (auto subscript = dyn_cast<SubscriptDecl>(decl)) {
-    assert((isNullableTypeInC(M, subscript->getElementType())
-            || subscript->getElementType()->hasArchetype())
-           && "subscript's result type is not nullable?!");
-    return subscript->hasClangNode();
+    return subscript->hasClangNode() &&
+           subscript->getElementType()->hasReferenceSemantics();
   }
   return false;
 }
@@ -2369,15 +2353,20 @@ static bool mayLieAboutNonOptionalReturn(SILModule &M,
 ///
 /// This is an awful hack that makes it possible to work around several kinds
 /// of problems:
+///   - initializers currently cannot fail, so they always return non-optional.
 ///   - an Objective-C method might have been annotated to state (incorrectly)
 ///     that it returns a non-optional object
 ///   - an Objective-C property might be annotated to state (incorrectly) that
 ///     it is non-optional
-static bool mayLieAboutNonOptionalReturn(SILModule &M, Expr *expr) {
+static bool mayLieAboutNonOptionalReturn(Expr *expr) {
   expr = expr->getSemanticsProvidingExpr();
 
-  // An application that produces a reference type, which we look through to
-  // get the function we're calling.
+  /// A reference to a declaration.
+  if (auto declRef = dyn_cast<DeclRefExpr>(expr)) {
+    return mayLieAboutNonOptionalReturn(declRef->getDecl());
+  }
+
+  // An application, which we look through to get the function we're calling.
   if (auto apply = dyn_cast<ApplyExpr>(expr)) {
     // The result has to be a nullable type.
     if (!isNullableTypeInC(M, apply->getType()))
@@ -2396,14 +2385,19 @@ static bool mayLieAboutNonOptionalReturn(SILModule &M, Expr *expr) {
     // or having a C-derived convention.
     ValueDecl *method = nullptr;
     if (auto selfApply = dyn_cast<ApplyExpr>(apply->getFn())) {
-      if (auto methodRef = dyn_cast<DeclRefExpr>(selfApply->getFn()))
+      if (auto methodRef = dyn_cast<DeclRefExpr>(selfApply->getFn())) {
         method = methodRef->getDecl();
+      }
     } else if (auto force = dyn_cast<ForceValueExpr>(apply->getFn())) {
       method = getFuncDeclFromDynamicMemberLookup(force->getSubExpr());
     } else if (auto bind = dyn_cast<BindOptionalExpr>(apply->getFn())) {
       method = getFuncDeclFromDynamicMemberLookup(bind->getSubExpr());
     } else if (auto fnRef = dyn_cast<DeclRefExpr>(apply->getFn())) {
-      method = fnRef->getDecl();
+      // Only consider a full application of a method. Partial applications
+      // never lie.
+      if (auto func = dyn_cast<AbstractFunctionDecl>(fnRef->getDecl()))
+        if (func->getParameterLists().size() == 1)
+          method = fnRef->getDecl();
     }
     if (method && mayLieAboutNonOptionalReturn(M, method))
       return true;
@@ -2423,31 +2417,27 @@ static bool mayLieAboutNonOptionalReturn(SILModule &M, Expr *expr) {
 
   // A load.
   if (auto load = dyn_cast<LoadExpr>(expr)) {
-    return mayLieAboutNonOptionalReturn(M, load->getSubExpr());
+    return mayLieAboutNonOptionalReturn(load->getSubExpr());
   }
 
-  // A reference to a member property.
+  // A reference to a member.
   if (auto member = dyn_cast<MemberRefExpr>(expr)) {
-    return isNullableTypeInC(M, member->getType()) &&
-      mayLieAboutNonOptionalReturn(M, member->getMember().getDecl());
+    return mayLieAboutNonOptionalReturn(member->getMember().getDecl());
   }
 
   // A reference to a subscript.
   if (auto subscript = dyn_cast<SubscriptExpr>(expr)) {
-    return isNullableTypeInC(M, subscript->getType()) &&
-      mayLieAboutNonOptionalReturn(M, subscript->getDecl().getDecl());
+    return mayLieAboutNonOptionalReturn(subscript->getDecl().getDecl());
   }
 
-  // A reference to a member property found via dynamic lookup.
+  // A reference to a member found via dynamic lookup.
   if (auto member = dyn_cast<DynamicMemberRefExpr>(expr)) {
-    return isNullableTypeInC(M, member->getType()) &&
-      mayLieAboutNonOptionalReturn(M, member->getMember().getDecl());
+    return mayLieAboutNonOptionalReturn(member->getMember().getDecl());
   }
 
   // A reference to a subscript found via dynamic lookup.
   if (auto subscript = dyn_cast<DynamicSubscriptExpr>(expr)) {
-    return isNullableTypeInC(M, subscript->getType()) &&
-      mayLieAboutNonOptionalReturn(M, subscript->getMember().getDecl());
+    return mayLieAboutNonOptionalReturn(subscript->getMember().getDecl());
   }
 
   return false;
@@ -2466,7 +2456,7 @@ RValue RValueEmitter::visitInjectIntoOptionalExpr(InjectIntoOptionalExpr *E,
   // resulting optional for nil. As a special case, when we're injecting the
   // result of an ObjC constructor into an optional, do it using an unchecked
   // bitcast, which is opaque to the optimizer.
-  if (mayLieAboutNonOptionalReturn(SGF.SGM.M, E->getSubExpr())) {
+  if (mayLieAboutNonOptionalReturn(E->getSubExpr())) {
     auto result = SGF.emitRValueAsSingleValue(E->getSubExpr());
     auto optType = SGF.getLoweredLoadableType(E->getType());
     SILValue bitcast = SGF.B.createUncheckedBitCast(E, result.getValue(),

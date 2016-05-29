@@ -129,16 +129,18 @@ FuncDecl *DerivedConformance::declareDerivedPropertyGetter(TypeChecker &tc,
                                                  bool isStatic) {
   auto &C = tc.Context;
   auto parentDC = cast<DeclContext>(parentDecl);
-  auto selfDecl = ParamDecl::createSelf(SourceLoc(), parentDC, isStatic);
+  auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), parentDC, isStatic);
   ParameterList *params[] = {
     ParameterList::createWithoutLoc(selfDecl),
     ParameterList::createEmpty(C)
   };
   
   FuncDecl *getterDecl =
-    FuncDecl::create(C, SourceLoc(), StaticSpellingKind::None, SourceLoc(),
-                     DeclName(), SourceLoc(), SourceLoc(), SourceLoc(),
-                     nullptr, Type(), params,
+    FuncDecl::create(C, /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
+                     /*FuncLoc=*/SourceLoc(), DeclName(), /*NameLoc=*/SourceLoc(),
+                     /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                     /*AccessorKeywordLoc=*/SourceLoc(),
+                     nullptr, params, Type(),
                      TypeLoc::withoutLoc(propertyContextType), parentDC);
   getterDecl->setImplicit();
   getterDecl->setStatic(isStatic);

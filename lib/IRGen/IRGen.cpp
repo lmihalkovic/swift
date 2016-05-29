@@ -66,6 +66,16 @@ using namespace swift;
 using namespace irgen;
 using namespace llvm;
 
+namespace {
+// We need this to access IRGenOptions from extension functions
+class PassManagerBuilderWrapper : public PassManagerBuilder {
+public:
+  const IRGenOptions &IRGOpts;
+  PassManagerBuilderWrapper(const IRGenOptions &IRGOpts)
+      : PassManagerBuilder(), IRGOpts(IRGOpts) {}
+};
+}
+
 static void addSwiftARCOptPass(const PassManagerBuilder &Builder,
                                PassManagerBase &PM) {
   if (Builder.OptLevel > 0)
@@ -84,6 +94,12 @@ static void addSwiftStackPromotionPass(const PassManagerBuilder &Builder,
     PM.add(createSwiftStackPromotionPass());
 }
 
+static void addSwiftMergeFunctionsPass(const PassManagerBuilder &Builder,
+                                       PassManagerBase &PM) {
+  if (Builder.OptLevel > 0)
+    PM.add(createSwiftMergeFunctionsPass());
+}
+
 static void addAddressSanitizerPasses(const PassManagerBuilder &Builder,
                                       legacy::PassManagerBase &PM) {
   PM.add(createAddressSanitizerFunctionPass());
@@ -93,6 +109,14 @@ static void addAddressSanitizerPasses(const PassManagerBuilder &Builder,
 static void addThreadSanitizerPass(const PassManagerBuilder &Builder,
                                    legacy::PassManagerBase &PM) {
   PM.add(createThreadSanitizerPass());
+}
+
+static void addSanitizerCoveragePass(const PassManagerBuilder &Builder,
+                                     legacy::PassManagerBase &PM) {
+  const PassManagerBuilderWrapper &BuilderWrapper =
+      static_cast<const PassManagerBuilderWrapper &>(Builder);
+  PM.add(createSanitizerCoverageModulePass(
+      BuilderWrapper.IRGOpts.SanitizeCoverage));
 }
 
 std::tuple<llvm::TargetOptions, std::string, std::vector<std::string>>
@@ -123,7 +147,7 @@ void swift::performLLVMOptimizations(IRGenOptions &Opts, llvm::Module *Module,
   SharedTimer timer("LLVM optimization");
 
   // Set up a pipeline.
-  PassManagerBuilder PMBuilder;
+  PassManagerBuilderWrapper PMBuilder(Opts);
 
   if (Opts.Optimize && !Opts.DisableLLVMOptzns) {
     PMBuilder.OptLevel = 3;
@@ -163,6 +187,17 @@ void swift::performLLVMOptimizations(IRGenOptions &Opts, llvm::Module *Module,
     PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
                            addThreadSanitizerPass);
   }
+
+  if (Opts.SanitizeCoverage.CoverageType !=
+      llvm::SanitizerCoverageOptions::SCK_None) {
+    PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
+                           addSanitizerCoveragePass);
+    PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
+                           addSanitizerCoveragePass);
+  }
+
+  PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
+                         addSwiftMergeFunctionsPass);
 
   // Configure the function passes.
   legacy::FunctionPassManager FunctionPasses(Module);
@@ -620,7 +655,8 @@ static std::unique_ptr<llvm::Module> performIRGeneration(IRGenOptions &Opts,
       });
     }
 
-    IGM.finalize();
+    if (!IGM.finalize())
+      return nullptr;
 
     setModuleFlags(IGM);
   }
@@ -813,7 +849,9 @@ static void performParallelIRGeneration(IRGenOptions &Opts,
       updateLinkage(F);
     }
 
-    IGM->finalize();
+    if (!IGM->finalize())
+      return;
+
     setModuleFlags(*IGM);
   }
 

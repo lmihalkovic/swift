@@ -179,6 +179,9 @@ namespace {
     /// The witness is less available than the requirement.
     Availability,
 
+    /// The requirement was marked explicitly unavailable.
+    Unavailable,
+
     /// The witness requires optional adjustments.
     OptionalityConflict,
 
@@ -732,7 +735,7 @@ matchWitness(TypeChecker &tc,
     // rethrows or be non-throwing.
     if (reqAttrs.hasAttribute<RethrowsAttr>() &&
         !witnessAttrs.hasAttribute<RethrowsAttr>() &&
-        cast<AbstractFunctionDecl>(witness)->isBodyThrowing())
+        cast<AbstractFunctionDecl>(witness)->hasThrows())
       return RequirementMatch(witness, MatchKind::RethrowsConflict);
 
     // We want to decompose the parameters to handle them separately.
@@ -1274,6 +1277,11 @@ checkWitness(Accessibility requiredAccess,
     return RequirementCheck(CheckKind::Availability, requiredAvailability);
   }
 
+  if (requirement->getAttrs().isUnavailable(TC.Context) &&
+      match.Witness->getDeclContext() == DC) {
+    return RequirementCheck(CheckKind::Unavailable);
+  }
+
   // A non-failable initializer requirement cannot be satisfied
   // by a failable initializer.
   if (auto ctor = dyn_cast<ConstructorDecl>(requirement)) {
@@ -1710,7 +1718,7 @@ diagnoseMatch(TypeChecker &tc, Module *module,
     fixDeclarationName(diag, match.Witness, req->getFullName());
 
     // Also fix the Objective-C name, if needed.
-    if (req->isObjC())
+    if (!match.Witness->canInferObjCFromRequirement(req))
       fixDeclarationObjCName(diag, match.Witness, req->getObjCRuntimeName());
     break;
   }
@@ -2028,7 +2036,8 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
   bool doNotDiagnoseMatches = false;
   bool ignoringNames = false;
   bool considerRenames =
-    !canDerive && !requirement->getAttrs().hasAttribute<OptionalAttr>();
+    !canDerive && !requirement->getAttrs().hasAttribute<OptionalAttr>() &&
+    !requirement->getAttrs().isUnavailable(TC.Context);
 
   if (findBestWitness(requirement,
                       considerRenames ? &ignoringNames : nullptr,
@@ -2041,6 +2050,7 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
     // If the name didn't actually line up, complain.
     if (ignoringNames && 
         requirement->getFullName() != best.Witness->getFullName()) {
+
       diagnoseOrDefer(requirement, false,
         [witness, requirement](TypeChecker &tc,
                                NormalProtocolConformance *conformance) {
@@ -2052,8 +2062,7 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
                                     witness->getFullName(),
                                     proto->getDeclaredType(),
                                     requirement->getFullName());
-            fixDeclarationName(diag, cast<AbstractFunctionDecl>(witness),
-                               requirement->getFullName());
+            fixDeclarationName(diag, witness, requirement->getFullName());
           }
 
           tc.diagnose(requirement, diag::protocol_requirement_here,
@@ -2108,6 +2117,12 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
           tc.diagnose(conformance->getLoc(),
                       diag::availability_conformance_introduced_here);
         });
+      break;
+    }
+
+    case CheckKind::Unavailable: {
+      auto *attr = requirement->getAttrs().getUnavailable(TC.Context);
+      TC.diagnoseUnavailableOverride(witness, requirement, attr);
       break;
     }
 
@@ -2346,7 +2361,7 @@ ResolveWitnessResult ConformanceChecker::resolveWitnessViaDefault(
   assert(!isa<AssociatedTypeDecl>(requirement) && "Use resolveTypeWitnessVia*");
 
   // An optional requirement is trivially satisfied with an empty requirement.
-  // An 'unavailable' requirement is treated like optional requirements.
+  // An 'unavailable' requirement is treated like an optional requirement.
   auto Attrs = requirement->getAttrs();
   if (Attrs.hasAttribute<OptionalAttr>() || Attrs.isUnavailable(TC.Context)) {
     recordOptionalWitness(requirement);
@@ -3637,7 +3652,9 @@ void ConformanceChecker::checkConformance() {
       if (!witness) return;
 
       // Objective-C checking for @objc requirements.
-      if (requirement->isObjC()) {
+      if (requirement->isObjC() &&
+          requirement->getFullName() == witness->getFullName() &&
+          !requirement->getAttrs().isUnavailable(TC.Context)) {
         // The witness must also be @objc.
         if (!witness->isObjC()) {
           bool isOptional =
@@ -3649,9 +3666,11 @@ void ConformanceChecker::checkConformance() {
                                                : diag::witness_non_objc,
                                     diagInfo.first, diagInfo.second,
                                     Proto->getFullName());
-            fixDeclarationObjCName(
-              diag, witness,
-              cast<AbstractFunctionDecl>(requirement)->getObjCSelector());
+            if (!witness->canInferObjCFromRequirement(requirement)) {
+              fixDeclarationObjCName(
+                diag, witness,
+                cast<AbstractFunctionDecl>(requirement)->getObjCSelector());
+            }
           } else if (isa<VarDecl>(witness)) {
             auto diag = TC.diagnose(witness,
                                     isOptional
@@ -3660,10 +3679,13 @@ void ConformanceChecker::checkConformance() {
                                     /*isSubscript=*/false,
                                     witness->getFullName(),
                                     Proto->getFullName());
-            fixDeclarationObjCName(
-               diag, witness,
-               ObjCSelector(requirement->getASTContext(), 0,
-                            cast<VarDecl>(requirement)->getObjCPropertyName()));
+            if (!witness->canInferObjCFromRequirement(requirement)) {
+              fixDeclarationObjCName(
+                 diag, witness,
+                 ObjCSelector(requirement->getASTContext(), 0,
+                              cast<VarDecl>(requirement)
+                                ->getObjCPropertyName()));
+            }
           } else if (isa<SubscriptDecl>(witness)) {
             TC.diagnose(witness,
                         isOptional
@@ -4063,13 +4085,21 @@ bool TypeChecker::conformsToProtocol(Type T, ProtocolDecl *Proto,
     recordDependency(nullptr);
   }
 
-  // If we're using this conformance and it is incomplete, queue it for
-  // completion.
+  // If we're using this conformance, note that.
   if (options.contains(ConformanceCheckFlags::Used) &&
-      lookupResult->isConcrete() &&
-      lookupResult->getConcrete()->isIncomplete()) {
-    auto normalConf = lookupResult->getConcrete()->getRootNormalConformance();
-    UsedConformances.insert(normalConf);
+      lookupResult->isConcrete()) {
+    auto concrete = lookupResult->getConcrete();
+    auto normalConf = concrete->getRootNormalConformance();
+
+    // If the conformance is incomplete, queue it for completion.
+    if (normalConf->isIncomplete())
+      UsedConformances.insert(normalConf);
+
+    // Record the usage of this conformance in the enclosing source
+    // file.
+    if (auto sf = DC->getParentSourceFile()) {
+      sf->addUsedConformance(normalConf);
+    }
   }
   return true;
 }
@@ -4105,6 +4135,25 @@ void TypeChecker::useObjectiveCBridgeableConformances(DeclContext *dc,
   if (!proto) return;
 
   type.walk(Walker(*this, dc, proto));
+}
+
+void TypeChecker::useObjectiveCBridgeableConformancesOfArgs(
+       DeclContext *dc, BoundGenericType *bound) {
+  auto proto = getProtocol(SourceLoc(),
+                           KnownProtocolKind::ObjectiveCBridgeable);
+  if (!proto) return;
+
+  // Check whether the bound generic type itself is bridged to
+  // Objective-C.
+  ConformanceCheckOptions options = ConformanceCheckFlags::InExpression
+    | ConformanceCheckFlags::SuppressDependencyTracking;
+  if (!conformsToProtocol(bound->getDecl()->getDeclaredType(), proto, dc,
+                          options))
+    return;
+
+  // Mark the conformances within the arguments.
+  for (auto arg : bound->getGenericArgs())
+    useObjectiveCBridgeableConformances(dc, arg);
 }
 
 void TypeChecker::checkConformance(NormalProtocolConformance *conformance) {
@@ -4192,11 +4241,11 @@ static unsigned scorePotentiallyMatchingNames(DeclName lhs, DeclName rhs,
 }
 
 /// Apply omit-needless-words to the given declaration, if possible.
-static Optional<DeclName> omitNeedlessWords(ValueDecl *value) {
+static Optional<DeclName> omitNeedlessWords(TypeChecker &tc, ValueDecl *value) {
   if (auto func = dyn_cast<AbstractFunctionDecl>(value))
-    return swift::omitNeedlessWords(func);
+    return tc.omitNeedlessWords(func);
   if (auto var = dyn_cast<VarDecl>(value)) {
-    if (auto newName = swift::omitNeedlessWords(var))
+    if (auto newName = tc.omitNeedlessWords(var))
       return DeclName(*newName);
     return None;
   }
@@ -4204,15 +4253,15 @@ static Optional<DeclName> omitNeedlessWords(ValueDecl *value) {
 }
 
 /// Determine the score between two potentially-matching declarations.
-static unsigned scorePotentiallyMatching(ValueDecl *req, ValueDecl *witness,
-                                         unsigned limit) {
+static unsigned scorePotentiallyMatching(TypeChecker &tc, ValueDecl *req,
+                                         ValueDecl *witness, unsigned limit) {
   DeclName reqName = req->getFullName();
   DeclName witnessName = witness->getFullName();
 
   // Apply the omit-needless-words heuristics to both names.
-  if (auto adjustedReqName = ::omitNeedlessWords(req))
+  if (auto adjustedReqName = ::omitNeedlessWords(tc, req))
     reqName = *adjustedReqName;
-  if (auto adjustedWitnessName = ::omitNeedlessWords(witness))
+  if (auto adjustedWitnessName = ::omitNeedlessWords(tc, witness))
     witnessName = *adjustedWitnessName;
 
   return scorePotentiallyMatchingNames(reqName, witnessName, isa<FuncDecl>(req),
@@ -4369,7 +4418,8 @@ static void diagnosePotentialWitness(TypeChecker &tc,
     // Special case: note to add @objc.
     auto diag = tc.diagnose(witness,
                             diag::optional_req_nonobjc_near_match_add_objc);
-    fixDeclarationObjCName(diag, witness, req->getObjCRuntimeName());
+    if (!witness->canInferObjCFromRequirement(req))
+      fixDeclarationObjCName(diag, witness, req->getObjCRuntimeName());
   } else {
     diagnoseMatch(tc, conformance->getDeclContext()->getParentModule(),
                   conformance, req, match);
@@ -4529,8 +4579,11 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
       SmallVector<ValueDecl *, 4> bestOptionalReqs;
       unsigned bestScore = UINT_MAX;
       for (auto req : unsatisfiedReqs) {
+        // Skip unavailable requirements.
+        if (req->getAttrs().isUnavailable(Context)) continue;
+
         // Score this particular optional requirement.
-        auto score = scorePotentiallyMatching(req, value, bestScore);
+        auto score = scorePotentiallyMatching(*this, req, value, bestScore);
 
         // If the score is better than the best we've seen, update the best
         // and clear out the list.

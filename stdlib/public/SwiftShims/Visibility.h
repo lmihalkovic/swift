@@ -36,6 +36,10 @@
 # define SWIFT_END_NULLABILITY_ANNOTATIONS
 #endif
 
+// TODO: support using shims headers in overlays by parameterizing
+// SWIFT_RUNTIME_EXPORT on the library it's exported from, then setting
+// protected vs. default based on the current value of __SWIFT_CURRENT_DYLIB.
+
 /// Attribute used to export symbols from the runtime.
 #if __MACH__
 # define SWIFT_RUNTIME_EXPORT __attribute__((visibility("default")))

@@ -169,7 +169,6 @@ func _conditionallyUnreachable() {
 }
 
 @_versioned
-@warn_unused_result
 @_silgen_name("_swift_isClassOrObjCExistentialType")
 func _swift_isClassOrObjCExistentialType<T>(_ x: T.Type) -> Bool
 
@@ -204,7 +203,7 @@ public func unsafeAddress(of object: AnyObject) -> UnsafePointer<Void> {
 
 @available(*, unavailable, renamed: "unsafeAddress(of:)")
 public func unsafeAddressOf(_ object: AnyObject) -> UnsafePointer<Void> {
-  Builtin.unreachable()
+  fatalError("unavailable function can't be called")
 }
 
 /// Converts a reference of type `T` to a reference of type `U` after
@@ -494,7 +493,7 @@ internal func _makeBridgeObject(
 public // @testable
 func _getSuperclass(_ t: AnyClass) -> AnyClass? {
   return unsafeBitCast(
-    _swift_class_getSuperclass(unsafeBitCast(t, to: OpaquePointer.self)),
+    swift_class_getSuperclass(unsafeBitCast(t, to: OpaquePointer.self)),
     to: AnyClass.self)
 }
 
@@ -594,5 +593,5 @@ func _isOptional<T>(_ type: T.Type) -> Bool {
 
 @available(*, unavailable, message: "Removed in Swift 3. Please use Optional.unsafelyUnwrapped instead.")
 public func unsafeUnwrap<T>(_ nonEmpty: T?) -> T {
-  Builtin.unreachable()
+  fatalError("unavailable function can't be called")
 }

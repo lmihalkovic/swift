@@ -94,8 +94,9 @@ static Type getExistentialArchetype(SILValue existential) {
 
 /// Retrieve the type to use for a method found via dynamic lookup.
 static CanSILFunctionType getDynamicMethodLoweredType(SILGenFunction &gen,
-                                                      SILValue proto,
-                                                      SILDeclRef methodName) {
+                                           SILValue proto,
+                                           SILDeclRef methodName,
+                                           CanAnyFunctionType substMemberTy) {
   auto &ctx = gen.getASTContext();
 
   // Determine the opaque 'self' parameter type.
@@ -107,15 +108,40 @@ static CanSILFunctionType getDynamicMethodLoweredType(SILGenFunction &gen,
   }
 
   // Replace the 'self' parameter type in the method type with it.
-  auto methodTy = gen.SGM.getConstantType(methodName).castTo<SILFunctionType>();
+  auto objcFormalTy = substMemberTy.withExtInfo(substMemberTy->getExtInfo()
+             .withSILRepresentation(SILFunctionTypeRepresentation::ObjCMethod));
+
+  auto methodTy = gen.SGM.M.Types
+    .getUncachedSILFunctionTypeForConstant(methodName, objcFormalTy);
   return replaceSelfTypeForDynamicLookup(ctx, methodTy, selfTy, methodName);
 }
 
+/// Check if we can perform a dynamic dispatch on a super method call.
 static bool canUseStaticDispatch(SILGenFunction &gen,
                                  SILDeclRef constant) {
   auto *funcDecl = cast<AbstractFunctionDecl>(constant.getDecl());
+
+  if (funcDecl->isFinal())
+    return true;
+
+  // We cannot form a direct reference to a method body defined in
+  // Objective-C.
+  if (constant.isForeign)
+    return false;
+
+  // If we cannot form a direct reference due to resilience constraints,
+  // we have to dynamic dispatch.
+  if (gen.F.isFragile() && !constant.isFragile())
+    return false;
+
+  // If the method is defined in the same module, we can reference it
+  // directly.
   auto thisModule = gen.SGM.M.getSwiftModule();
-  return funcDecl->isFinal() || (thisModule == funcDecl->getModuleContext());
+  if (thisModule == funcDecl->getModuleContext())
+    return true;
+
+  // Otherwise, we must dynamic dispatch.
+  return false;
 }
 
 namespace {
@@ -281,17 +307,17 @@ private:
 
   /// Add the 'self' type to the substituted function type of this
   /// dynamic callee.
-  void addDynamicCalleeSelfToFormalType(SILGenModule &SGM) {
+  void addDynamicCalleeSelfToFormalType(SILGenModule &SGM,
+                                        CanAnyFunctionType substFormalType) {
     assert(kind == Kind::DynamicMethod);
 
-    // Drop the original self clause.
-    CanType methodType = OrigFormalInterfaceType.getResult();
-
-    // Replace it with the dynamic self type.
+    // Add the dynamic self type to the substituted type. Even if the dynamic
+    // callee came from a generic ObjC class, when we find it on AnyObject the
+    // parameters should be substituted with their upper bound types.
     OrigFormalInterfaceType
       = getDynamicMethodFormalType(SGM, SelfValue,
                                    Constant.getDecl(),
-                                   Constant, methodType);
+                                   Constant, substFormalType);
     assert(!OrigFormalInterfaceType->hasTypeParameter());
 
     // Add a self clause to the substituted type.
@@ -335,6 +361,9 @@ public:
                                SILDeclRef name,
                                CanAnyFunctionType substFormalType,
                                SILLocation l) {
+    while (auto *UI = dyn_cast<UpcastInst>(selfValue))
+      selfValue = UI->getOperand();
+
     return Callee(Kind::SuperMethod, gen, selfValue, name,
                   substFormalType, l);
   }
@@ -354,7 +383,7 @@ public:
                            SILLocation l) {
     Callee callee(Kind::DynamicMethod, gen, proto, name,
                   substFormalType, l);
-    callee.addDynamicCalleeSelfToFormalType(gen.SGM);
+    callee.addDynamicCalleeSelfToFormalType(gen.SGM, substFormalType);
     return callee;
   }
   Callee(Callee &&) = default;
@@ -425,7 +454,6 @@ public:
   getAtUncurryLevel(SILGenFunction &gen, unsigned level) const {
     ManagedValue mv;
     ApplyOptions options = ApplyOptions::None;
-    SILConstantInfo constantInfo;
     Optional<SILDeclRef> constant = None;
 
     switch (kind) {
@@ -447,7 +475,7 @@ public:
           if (getMethodDispatch(func) == MethodDispatch::Class)
             constant = constant->asDirectReference(true);
       
-      constantInfo = gen.getConstantInfo(*constant);
+      auto constantInfo = gen.getConstantInfo(*constant);
       SILValue ref = gen.emitGlobalFunctionRef(Loc, *constant, constantInfo);
       mv = ManagedValue::forUnmanaged(ref);
       break;
@@ -456,7 +484,7 @@ public:
       assert(level <= Constant.uncurryLevel
              && "uncurrying past natural uncurry level of enum constructor");
       constant = Constant.atUncurryLevel(level);
-      constantInfo = gen.getConstantInfo(*constant);
+      auto constantInfo = gen.getConstantInfo(*constant);
 
       // We should not end up here if the enum constructor call is fully
       // applied.
@@ -470,7 +498,7 @@ public:
       assert(level <= Constant.uncurryLevel
              && "uncurrying past natural uncurry level of method");
       constant = Constant.atUncurryLevel(level);
-      constantInfo = gen.getConstantInfo(*constant);
+      auto constantInfo = gen.getConstantInfo(*constant);
 
       // If the call is curried, emit a direct call to the curry thunk.
       if (level < Constant.uncurryLevel) {
@@ -496,7 +524,7 @@ public:
              "Currying the self parameter of super method calls should've been emitted");
 
       constant = Constant.atUncurryLevel(level);
-      constantInfo = gen.getConstantInfo(*constant);
+      auto constantInfo = gen.getConstantInfo(*constant);
 
       if (SILDeclRef baseConstant = Constant.getBaseOverriddenVTableEntry())
         constantInfo = gen.SGM.Types.getConstantOverrideInfo(Constant,
@@ -514,7 +542,7 @@ public:
       assert(level <= Constant.uncurryLevel
              && "uncurrying past natural uncurry level of method");
       constant = Constant.atUncurryLevel(level);
-      constantInfo = gen.getConstantInfo(*constant);
+      auto constantInfo = gen.getConstantInfo(*constant);
 
       // If the call is curried, emit a direct call to the curry thunk.
       if (level < Constant.uncurryLevel) {
@@ -550,11 +578,16 @@ public:
              && "uncurrying past natural uncurry level of method");
 
       auto constant = Constant.atUncurryLevel(level);
-      constantInfo = gen.getConstantInfo(constant);
+      // Lower the substituted type from the AST, which should have any generic
+      // parameters in the original signature erased to their upper bounds.
+      auto objcFormalType = SubstFormalType.withExtInfo(
+         SubstFormalType->getExtInfo()
+           .withSILRepresentation(SILFunctionTypeRepresentation::ObjCMethod));
+      auto fnType = gen.SGM.M.Types
+        .getUncachedSILFunctionTypeForConstant(constant, objcFormalType);
 
       auto closureType =
-        replaceSelfTypeForDynamicLookup(gen.getASTContext(),
-                                constantInfo.SILFnType,
+        replaceSelfTypeForDynamicLookup(gen.getASTContext(), fnType,
                                 SelfValue->getType().getSwiftRValueType(),
                                 Constant);
 
@@ -1292,14 +1325,9 @@ public:
     setSelfParam(ArgumentSource(arg, RValue(SGF, apply, superFormalType, super)),
                  apply);
 
-    if (constant.isForeign || !canUseStaticDispatch(SGF, constant)) {
-      // All Objective-C methods and
-      // non-final native Swift methods use dynamic dispatch.
-      SILValue Input = super.getValue();
-      while (auto *UI = dyn_cast<UpcastInst>(Input))
-        Input = UI->getOperand();
+    if (!canUseStaticDispatch(SGF, constant)) {
       // ObjC super calls require dynamic dispatch.
-      setCallee(Callee::forSuperMethod(SGF, Input, constant,
+      setCallee(Callee::forSuperMethod(SGF, super.getValue(), constant,
                                        getSubstFnType(), fn));
     } else {
       // Native Swift super calls to final methods are direct.
@@ -4371,16 +4399,12 @@ static Callee getBaseAccessorFunctionRef(SILGenFunction &gen,
   // perform a dynamic dispatch.
   auto self = selfValue.forceAndPeekRValue(gen).peekScalarValue();
   if (!isSuper)
-    return Callee::forClassMethod(gen, self, constant, substAccessorType,
-                                  loc);
+    return Callee::forClassMethod(gen, self, constant, substAccessorType, loc);
 
   // If this is a "super." dispatch, we do a dynamic dispatch for objc methods
   // or non-final native Swift methods.
-  while (auto *upcast = dyn_cast<UpcastInst>(self))
-    self = upcast->getOperand();
-
-  if (constant.isForeign || !canUseStaticDispatch(gen, constant))
-    return Callee::forSuperMethod(gen, self, constant, substAccessorType,loc);
+  if (!canUseStaticDispatch(gen, constant))
+    return Callee::forSuperMethod(gen, self, constant, substAccessorType, loc);
 
   return Callee::forDirect(gen, constant, substAccessorType, loc);
 }
@@ -4871,14 +4895,8 @@ static SILValue emitDynamicPartialApply(SILGenFunction &gen,
 
   // Retain 'self' because the partial apply will take ownership.
   // We can't simply forward 'self' because the partial apply is conditional.
-#if 0
-  auto CMV = ConsumableManagedValue(ManagedValue::forUnmanaged(self),
-                                    CastConsumptionKind::CopyOnSuccess);
-  self = gen.getManagedValue(loc, CMV).forward(gen);
-#else
   if (!self->getType().isAddress())
     gen.B.emitRetainValueOperation(loc, self);
-#endif
 
   SILValue result = gen.B.createPartialApply(loc, method, method->getType(), {},
                                              self, partialApplyTy);
@@ -4918,6 +4936,8 @@ RValue SILGenFunction::emitDynamicMemberRefExpr(DynamicMemberRefExpr *e,
   SILBasicBlock *hasMemberBB = createBasicBlock();
 
   // The continuation block
+  auto memberMethodTy = e->getType()->getAnyOptionalObjectType();
+  
   const TypeLowering &optTL = getTypeLowering(e->getType());
   auto loweredOptTy = optTL.getLoweredType();
 
@@ -4925,9 +4945,11 @@ RValue SILGenFunction::emitDynamicMemberRefExpr(DynamicMemberRefExpr *e,
 
   // Create the branch.
   FuncDecl *memberFunc;
-  if (auto *VD = dyn_cast<VarDecl>(e->getMember().getDecl()))
+  if (auto *VD = dyn_cast<VarDecl>(e->getMember().getDecl())) {
     memberFunc = VD->getGetter();
-  else
+    memberMethodTy = FunctionType::get(getASTContext().TheEmptyTupleType,
+                                       memberMethodTy);
+  } else
     memberFunc = cast<FuncDecl>(e->getMember().getDecl());
   SILDeclRef member(memberFunc, SILDeclRef::Kind::Func,
                     SILDeclRef::ConstructAtBestResilienceExpansion,
@@ -4950,7 +4972,12 @@ RValue SILGenFunction::emitDynamicMemberRefExpr(DynamicMemberRefExpr *e,
       methodTy = CanFunctionType::get(TupleType::getEmpty(getASTContext()),
                                       methodTy);
 
-    auto dynamicMethodTy = getDynamicMethodLoweredType(*this, operand, member);
+    auto memberFnTy = CanFunctionType::get(
+                                       operand->getType().getSwiftRValueType(),
+                                       memberMethodTy->getCanonicalType());
+
+    auto dynamicMethodTy = getDynamicMethodLoweredType(*this, operand, member,
+                                                       memberFnTy);
     auto loweredMethodTy = SILType::getPrimitiveObjectType(dynamicMethodTy);
     SILValue memberArg = new (F.getModule()) SILArgument(hasMemberBB,
                                                          loweredMethodTy);
@@ -5029,11 +5056,16 @@ RValue SILGenFunction::emitDynamicSubscriptExpr(DynamicSubscriptExpr *e,
     FullExpr hasMemberScope(Cleanups, CleanupLocation(e));
 
     // The argument to the has-member block is the uncurried method.
+    // Build the substituted getter type from the AST nodes.
     auto valueTy = e->getType()->getCanonicalType().getAnyOptionalObjectType();
-    auto methodTy =
-      subscriptDecl->getGetter()->getType()->castTo<AnyFunctionType>()
-                      ->getResult()->getCanonicalType();
-    auto dynamicMethodTy = getDynamicMethodLoweredType(*this, base, member);
+    auto indexTy = e->getIndex()->getType()->getCanonicalType();
+    auto methodTy = CanFunctionType::get(indexTy,
+                                         valueTy);
+    
+    auto functionTy = CanFunctionType::get(base->getType().getSwiftRValueType(),
+                                           methodTy);
+    auto dynamicMethodTy = getDynamicMethodLoweredType(*this, base, member,
+                                                       functionTy);
     auto loweredMethodTy = SILType::getPrimitiveObjectType(dynamicMethodTy);
     SILValue memberArg = new (F.getModule()) SILArgument(hasMemberBB,
                                                          loweredMethodTy);

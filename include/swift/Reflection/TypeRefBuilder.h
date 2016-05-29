@@ -19,7 +19,6 @@
 #define SWIFT_REFLECTION_TYPEREFBUILDER_H
 
 #include "swift/Remote/MetadataReader.h"
-#include "swift/Reflection/MetadataSourceBuilder.h"
 #include "swift/Reflection/Records.h"
 #include "swift/Reflection/TypeLowering.h"
 #include "swift/Reflection/TypeRef.h"
@@ -69,14 +68,13 @@ public:
 using FieldSection = ReflectionSection<FieldDescriptorIterator>;
 using AssociatedTypeSection = ReflectionSection<AssociatedTypeIterator>;
 using BuiltinTypeSection = ReflectionSection<BuiltinTypeDescriptorIterator>;
-using CaptureSection = ReflectionSection<CaptureDescriptorIterator>;
 using GenericSection = ReflectionSection<const void *>;
 
 struct ReflectionInfo {
+  std::string ImageName;
   FieldSection fieldmd;
   AssociatedTypeSection assocty;
   BuiltinTypeSection builtin;
-  CaptureSection capture;
   GenericSection typeref;
   GenericSection reflstr;
 };
@@ -86,7 +84,8 @@ struct ClosureContextInfo {
   std::vector<std::pair<const TypeRef *, const MetadataSource *>> MetadataSources;
   unsigned NumBindings = 0;
 
-  void dump(std::ostream &OS);
+  void dump() const;
+  void dump(std::ostream &OS) const;
 };
 
 /// An implementation of MetadataReader's BuilderType concept for
@@ -114,7 +113,6 @@ private:
   std::vector<std::unique_ptr<const TypeRef>> TypeRefPool;
 
   TypeConverter TC;
-  MetadataSourceBuilder MSB;
 
 #define TYPEREF(Id, Parent) \
   std::unordered_map<TypeRefID, const Id##TypeRef *, \
@@ -229,10 +227,6 @@ public:
     return WeakStorageTypeRef::create(*this, base);
   }
 
-  const SILBoxTypeRef *createSILBoxType(const TypeRef *base) {
-    return SILBoxTypeRef::create(*this, base);
-  }
-
   const ObjCClassTypeRef *
   createObjCClassType(const std::string &mangledName) {
     return ObjCClassTypeRef::create(*this, mangledName);
@@ -289,6 +283,10 @@ public:
   /// Get the primitive type lowering for a builtin type.
   const BuiltinTypeDescriptor *getBuiltinTypeInfo(const TypeRef *TR);
 
+  /// Get the raw capture descriptor for a remote capture descriptor
+  /// address.
+  const CaptureDescriptor *getCaptureDescriptor(uintptr_t RemoteAddress);
+
   /// Get the unsubstituted capture types for a closure context.
   ClosureContextInfo getClosureContextInfo(const CaptureDescriptor &CD);
 
@@ -301,7 +299,6 @@ public:
   void dumpFieldSection(std::ostream &OS);
   void dumpAssociatedTypeSection(std::ostream &OS);
   void dumpBuiltinTypeSection(std::ostream &OS);
-  void dumpCaptureSection(std::ostream &OS);
   void dumpAllSections(std::ostream &OS);
 };
 

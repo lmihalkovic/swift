@@ -131,6 +131,7 @@ static void addCommonFrontendArgs(const ToolChain &TC,
   inputArgs.AddLastArg(arguments, options::OPT_profile_coverage_mapping);
   inputArgs.AddLastArg(arguments, options::OPT_warnings_as_errors);
   inputArgs.AddLastArg(arguments, options::OPT_sanitize_EQ);
+  inputArgs.AddLastArg(arguments, options::OPT_sanitize_coverage_EQ);
 
   // Pass on any build config options
   inputArgs.AddAllArgs(arguments, options::OPT_D);
@@ -1047,7 +1048,7 @@ toolchains::Darwin::constructInvocation(const LinkJobAction &job,
     Arguments.push_back("-application_extension");
   }
 
-  // Liking in sanitizers will add rpaths, which might negatively interact when
+  // Linking sanitizers will add rpaths, which might negatively interact when
   // other rpaths are involved, so we should make sure we add the rpaths after
   // all user-specified rpaths.
   if (context.OI.SelectedSanitizer == SanitizerKind::Address)
@@ -1217,6 +1218,11 @@ std::string toolchains::GenericUnix::getDefaultLinker() const {
     // section on these targets, it also generates COPY relocations for
     // final executables, as such, unless specified, we default to gold
     // linker.
+    return "gold";
+  case llvm::Triple::x86_64:
+  case llvm::Triple::ppc64:
+  case llvm::Triple::ppc64le:
+    // BFD linker has issues wrt relocations against protected symbols.
     return "gold";
   default:
     // Otherwise, use the default BFD linker.

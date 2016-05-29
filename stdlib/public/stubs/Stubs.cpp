@@ -283,9 +283,10 @@ extern "C" long double _swift_fmodl(long double lhs, long double rhs) {
 #if (defined(__linux__) && defined(__x86_64__)) || \
     (defined(__linux__) && defined(__aarch64__)) || \
     (defined(__linux__) && defined(__powerpc64__)) || \
+    (defined(__linux__) && defined(__s390x__)) || \
     (defined(__ANDROID__) && defined(__arm64__))
 
-typedef int      ti_int __attribute__ ((mode (TI)));
+typedef int ti_int __attribute__((__mode__(TI)));
 SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 ti_int
@@ -335,7 +336,7 @@ __muloti4(ti_int a, ti_int b, int* overflow)
 // some other lower-level architecture issue that I'm
 // missing.  Perhaps relevant bug report:
 // FIXME: https://llvm.org/bugs/show_bug.cgi?id=14469
-typedef int      di_int __attribute__ ((mode (DI)));
+typedef int di_int __attribute__((__mode__(DI)));
 SWIFT_RUNTIME_STDLIB_INTERFACE
 extern "C"
 di_int

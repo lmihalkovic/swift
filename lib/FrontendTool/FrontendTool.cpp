@@ -554,20 +554,28 @@ private:
     if (FixitAll)
       return true;
 
-    // Err on the side of caution and don't automatically add bang, which may
-    // lead to crashes.
-    if (Info.ID == diag::missing_unwrap_optional.ID)
-      return false;
-
     // Do not add a semi as it is wrong in most cases during migration
     if (Info.ID == diag::statement_same_line_without_semi.ID)
+      return false;
+    // The following interact badly with the swift migrator, they are undoing
+    // migration of arguments to preserve the no-label for first argument.
+    if (Info.ID == diag::witness_argument_name_mismatch.ID ||
+      Info.ID == diag::missing_argument_labels.ID ||
+      Info.ID == diag::override_argument_name_mismatch.ID)
+      return false;
+    // This also interacts badly with the swift migrator, it unnecessary adds
+    // @objc(selector) attributes triggered by the mismatched label changes.
+    if (Info.ID == diag::objc_witness_selector_mismatch.ID ||
+        Info.ID == diag::witness_non_objc.ID)
       return false;
 
     if (Kind == DiagnosticKind::Error)
       return true;
     if (Info.ID == diag::forced_downcast_coercion.ID ||
         Info.ID == diag::forced_downcast_noop.ID ||
-        Info.ID == diag::variable_never_mutated.ID)
+        Info.ID == diag::variable_never_mutated.ID ||
+        Info.ID == diag::function_type_no_parens.ID ||
+        Info.ID == diag::parameter_extraneous_double_up.ID)
       return true;
     return false;
   }

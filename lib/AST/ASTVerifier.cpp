@@ -2226,13 +2226,36 @@ struct ASTNodeBase {};
       // Throwing @objc methods must have a foreign error convention.
       if (AFD->isObjC() &&
           static_cast<bool>(AFD->getForeignErrorConvention())
-            != AFD->isBodyThrowing()) {
-        if (AFD->isBodyThrowing())
+            != AFD->hasThrows()) {
+        if (AFD->hasThrows())
           Out << "@objc method throws but does not have a foreign error "
               << "convention";
         else
           Out << "@objc method has a foreign error convention but does not "
               << "throw";
+        abort();
+      }
+
+      // If a decl has the Throws bit set, the ThrowsLoc should be valid,
+      // and vice versa, unless the decl was imported, de-serialized, or
+      // implicit.
+      if (!AFD->isImplicit() &&
+          isa<SourceFile>(AFD->getModuleScopeContext()) &&
+          (AFD->getThrowsLoc().isValid() != AFD->hasThrows())) {
+        Out << "function 'throws' location does not match 'throws' flag\n";
+        AFD->dump(Out);
+        abort();
+      }
+
+      // If a decl has the Throws bit set, the function type should throw,
+      // and vice versa.
+      auto fnTy = AFD->getType()->castTo<AnyFunctionType>();
+      for (unsigned i = 1, e = AFD->getNaturalArgumentCount(); i != e; ++i)
+        fnTy = fnTy->getResult()->castTo<AnyFunctionType>();
+
+      if (AFD->hasThrows() != fnTy->getExtInfo().throws()) {
+        Out << "function 'throws' flag does not match function type\n";
+        AFD->dump(Out);
         abort();
       }
 
@@ -2746,14 +2769,6 @@ struct ASTNodeBase {};
       }
       checkSourceRanges(D->getSourceRange(), Parent,
                         [&]{ D->print(Out); });
-      if (auto *VD = dyn_cast<VarDecl>(D)) {
-        if (!VD->getTypeSourceRangeForDiagnostics().isValid()) {
-          Out << "invalid type source range for variable decl: ";
-          D->print(Out);
-          Out << "\n";
-          abort();
-        }
-      }
     }
 
     /// \brief Verify that the given source ranges is contained within the

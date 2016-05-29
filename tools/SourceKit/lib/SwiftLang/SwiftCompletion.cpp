@@ -16,6 +16,7 @@
 #include "SourceKit/Support/Logging.h"
 #include "SourceKit/Support/UIdent.h"
 
+#include "swift/Basic/Fallthrough.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IDE/CodeCompletionCache.h"
@@ -819,6 +820,40 @@ static void translateCodeCompletionOptions(OptionsDictionary &from,
   from.valueForOption(KeyTopNonLiteral, to.showTopNonLiteralResults);
 }
 
+/// Canonicalize a name that is in the format of a reference to a function into
+/// the name format used internally for filtering.
+///
+/// Returns true if the name is invalid.
+static bool canonicalizeFilterName(const char *origName,
+                                   SmallVectorImpl<char> &Result) {
+  assert(origName);
+  const char *p = origName;
+  char curr = '\0';
+  char prev;
+
+  // FIXME: disallow unnamed parameters without underscores `foo(::)`.
+  while (true) {
+    prev = curr;
+    curr = *p++;
+    switch (curr) {
+    case '\0':
+      return false; // Done.
+    case '_':
+      // Remove the _ underscore for an unnamed parameter.
+      if (prev == ':' || prev == '(') {
+        char next = *p;
+        if (next == ':' || next == ')')
+          continue;
+      }
+      SWIFT_FALLTHROUGH;
+    default:
+      Result.push_back(curr);
+      continue;
+    }
+  }
+  llvm_unreachable("exit is on null byte");
+}
+
 static void translateFilterRules(ArrayRef<FilterRule> rawFilterRules,
                                  CodeCompletion::FilterRules &filterRules) {
   for (auto &rule : rawFilterRules) {
@@ -828,7 +863,11 @@ static void translateFilterRules(ArrayRef<FilterRule> rawFilterRules,
       break;
     case FilterRule::Identifier:
       for (auto name : rule.names) {
-        filterRules.hideByName[name] = rule.hide;
+        SmallString<128> canonName;
+        // Note: name is null-terminated.
+        if (canonicalizeFilterName(name.data(), canonName))
+          continue;
+        filterRules.hideByName[canonName] = rule.hide;
       }
       break;
     case FilterRule::Module:
@@ -889,14 +928,24 @@ template <typename Result>
 static std::vector<Result *>
 filterInnerResults(ArrayRef<Result *> results, bool includeInner,
                    bool includeInnerOperators,
-
-                   bool &hasDot, bool &hasQDot, bool &hasInit) {
+                   bool &hasDot, bool &hasQDot, bool &hasInit,
+                   const CodeCompletion::FilterRules &rules) {
   std::vector<Result *> topResults;
   for (auto *result : results) {
     if (!includeInnerOperators && result->isOperator())
       continue;
 
+    llvm::SmallString<64> name;
+    {
+      llvm::raw_svector_ostream OSS(name);
+      CodeCompletion::CompletionBuilder::getFilterName(
+          result->getCompletionString(), OSS);
+    }
+    if (rules.hideCompletion(result, name))
+      continue;
+
     bool inner = checkInnerResult(result, hasDot, hasQDot, hasInit);
+
     if (!inner ||
         (includeInner &&
          result->getSemanticContext() <= SemanticContextKind::CurrentNominal))
@@ -950,13 +999,14 @@ static void transformAndForwardResults(
       options, session->getCompletionKind(),
       session->getCompletionHasExpectedTypes());
 
+  auto &rules = session->getFilterRules();
+
   bool hasEarlyInnerResults =
       session->getCompletionKind() == CompletionKind::PostfixExpr;
 
   if (!hasEarlyInnerResults) {
     organizer.addCompletionsWithFilter(session->getSortedCompletions(),
-                                       filterText, session->getFilterRules(),
-                                       exactMatch);
+                                       filterText, rules, exactMatch);
   }
 
   if (hasEarlyInnerResults &&
@@ -967,18 +1017,19 @@ static void transformAndForwardResults(
     auto completions = session->getSortedCompletions();
     auto innerResults =
         filterInnerResults(completions, options.addInnerResults,
-                           options.addInnerOperators, hasDot, hasQDot, hasInit);
+                           options.addInnerOperators, hasDot, hasQDot, hasInit,
+                           rules);
     if (options.addInnerOperators) {
-      if (hasInit)
+      if (hasInit && !rules.hideName("("))
         innerResults.insert(innerResults.begin(), buildParen());
-      if (hasDot)
+      if (hasDot && !rules.hideName("."))
         innerResults.insert(innerResults.begin(), buildDot());
-      if (hasQDot)
+      if (hasQDot && !rules.hideName("?."))
         innerResults.insert(innerResults.begin(), buildQDot());
     }
 
     organizer.addCompletionsWithFilter(innerResults, filterText,
-                                       session->getFilterRules(), exactMatch);
+                                       CodeCompletion::FilterRules(), exactMatch);
   }
 
   organizer.groupAndSort(options);
@@ -994,7 +1045,7 @@ static void transformAndForwardResults(
         SwiftCompletionInfo &info) {
       auto topResults = filterInnerResults(results, options.addInnerResults,
                                            options.addInnerOperators, hasDot,
-                                           hasQDot, hasInit);
+                                           hasQDot, hasInit, rules);
       // FIXME: Overriding the default to context "None" is a hack so that they
       // won't overwhelm other results that also match the filter text.
       innerResults = extendCompletions(
@@ -1024,18 +1075,18 @@ static void transformAndForwardResults(
     }
 
     if (options.addInnerOperators) {
-      if (hasInit)
+      if (hasInit && !rules.hideName("("))
         innerResults.insert(innerResults.begin(), buildParen());
-      if (hasDot)
+      if (hasDot && !rules.hideName("."))
         innerResults.insert(innerResults.begin(), buildDot());
-      if (hasQDot)
+      if (hasQDot && !rules.hideName("?."))
         innerResults.insert(innerResults.begin(), buildQDot());
     }
 
     // Add the inner results (and don't filter them).
     exactMatch = nullptr; // No longer needed.
     organizer.addCompletionsWithFilter(innerResults, filterText,
-                                       session->getFilterRules(), exactMatch);
+                                       CodeCompletion::FilterRules(), exactMatch);
 
     CodeCompletion::Options noGroupOpts = options;
     noGroupOpts.groupStems = false;
@@ -1201,10 +1252,16 @@ void SwiftLangSupport::codeCompleteSetPopularAPI(
   ThreadSafeRefCntPtr<SwiftPopularAPI> newPopularAPI(new SwiftPopularAPI);
   auto &nameToFactor = newPopularAPI->nameToFactor;
   for (unsigned i = 0, n = popularAPI.size(); i < n; ++i) {
-    nameToFactor[popularAPI[i]] = Factor(double(n - i) / n);
+    SmallString<64> name;
+    if (canonicalizeFilterName(popularAPI[i], name))
+      continue;
+    nameToFactor[name] = Factor(double(n - i) / n);
   }
   for (unsigned i = 0, n = unpopularAPI.size(); i < n; ++i) {
-    nameToFactor[unpopularAPI[i]] = Factor(-double(n - i) / n);
+    SmallString<64> name;
+    if (canonicalizeFilterName(unpopularAPI[i], name))
+      continue;
+    nameToFactor[name] = Factor(-double(n - i) / n);
   }
 
   PopularAPI = newPopularAPI; // replace the old popular API.

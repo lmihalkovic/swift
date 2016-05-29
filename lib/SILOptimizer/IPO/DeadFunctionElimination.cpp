@@ -55,7 +55,7 @@ protected:
 
   llvm::SmallSetVector<SILFunction *, 16> Worklist;
 
-  llvm::SmallPtrSet<SILFunction *, 100> AliveFunctions;
+  llvm::SmallPtrSet<SILFunction *, 32> AliveFunctions;
 
   /// Checks is a function is alive, e.g. because it is visible externally.
   bool isAnchorFunction(SILFunction *F) {
@@ -217,8 +217,7 @@ protected:
     // If a vtable or witness table (method) is only visible in another module
     // it can be accessed inside that module and we don't see this access.
     // We hit this case e.g. if a table is imported from the stdlib.
-    if (decl->getDeclContext()->getParentModule() !=
-        Module->getAssociatedContext()->getParentModule())
+    if (decl->getDeclContext()->getParentModule() != Module->getSwiftModule())
       return true;
 
     return false;

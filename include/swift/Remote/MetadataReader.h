@@ -243,12 +243,6 @@ class TypeDecoder {
         return BuiltType();
       return Builder.createWeakStorageType(base);
     }
-    case NodeKind::SILBoxType: {
-      auto base = decodeMangledType(Node->getChild(0));
-      if (!base)
-        return BuiltType();
-      return Builder.createSILBoxType(base);
-    }
     default:
       return BuiltType();
     }
@@ -682,20 +676,13 @@ public:
     }
   }
 
-  BuiltType readTypeFromMangledName(const char *MangledTypeName,
-                                    size_t Length) {
-    auto Demangled = Demangle::demangleSymbolAsNode(MangledTypeName, Length);
-    return decodeMangledType(Demangled);
-  }
-
   /// Read the isa pointer of a class or closure context instance and apply
   /// the isa mask.
   std::pair<bool, StoredPointer> readMetadataFromInstance(
       StoredPointer ObjectAddress) {
-    StoredPointer isaMaskValue = ~0;
     auto isaMask = readIsaMask();
-    if (isaMask.first)
-      isaMaskValue = isaMask.second;
+    if (!isaMask.first)
+      return {false, 0};
 
     StoredPointer MetadataAddress;
     if (!Reader->readBytes(RemoteAddress(ObjectAddress),
@@ -704,6 +691,68 @@ public:
       return {false, 0};
 
     return {true, MetadataAddress & isaMaskValue};
+  }
+
+  /// Read the parent type metadata from a nested nominal type metadata.
+  std::pair<bool, StoredPointer>
+  readParentFromMetadata(StoredPointer metadata) {
+    auto Meta = readMetadata(metadata);
+    if (!Meta)
+      return std::make_pair(false, 0);
+
+    auto descriptorAddress = readAddressOfNominalTypeDescriptor(Meta);
+    if (!descriptorAddress)
+      return std::make_pair(false, 0);
+
+    // Read the nominal type descriptor.
+    auto descriptor = readNominalTypeDescriptor(descriptorAddress);
+    if (!descriptor)
+      return std::make_pair(false, 0);
+
+    // Read the parent type if the type has one.
+    if (descriptor->GenericParams.Flags.hasParent()) {
+      StoredPointer parentAddress = getNominalParent(Meta, descriptor);
+      if (!parentAddress)
+        return std::make_pair(false, 0);
+      return std::make_pair(true, parentAddress);
+    }
+
+    return std::make_pair(false, 0);
+  }
+
+  /// Read a single generic type argument from a bound generic type
+  /// metadata.
+  std::pair<bool, StoredPointer>
+  readGenericArgFromMetadata(StoredPointer metadata, unsigned index) {
+    auto Meta = readMetadata(metadata);
+    if (!Meta)
+      return std::make_pair(false, 0);
+
+    auto descriptorAddress = readAddressOfNominalTypeDescriptor(Meta);
+    if (!descriptorAddress)
+      return std::make_pair(false, 0);
+
+    // Read the nominal type descriptor.
+    auto descriptor = readNominalTypeDescriptor(descriptorAddress);
+    if (!descriptor)
+      return std::make_pair(false, 0);
+
+    auto numGenericParams = descriptor->GenericParams.NumPrimaryParams;
+    auto offsetToGenericArgs =
+      sizeof(StoredPointer) * (descriptor->GenericParams.Offset);
+    auto addressOfGenericArgAddress =
+      Meta.getAddress() + offsetToGenericArgs +
+      index * sizeof(StoredPointer);
+
+    if (index >= numGenericParams)
+      return std::make_pair(false, 0);
+
+    StoredPointer genericArgAddress;
+    if (!Reader->readInteger(RemoteAddress(addressOfGenericArgAddress),
+                             &genericArgAddress))
+      return std::make_pair(false, 0);
+
+    return std::make_pair(true, genericArgAddress);
   }
 
   /// Given the address of a nominal type descriptor, attempt to resolve

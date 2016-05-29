@@ -32,7 +32,7 @@ public struct EmptyIterator<Element> : IteratorProtocol, Sequence {
 
 /// A collection whose element type is `Element` but that is always empty.
 public struct EmptyCollection<Element> :
-  RandomAccessCollection, MutableCollection, Equatable
+  RandomAccessCollection, MutableCollection
 {
   /// A type that represents a valid position in the collection.
   ///
@@ -61,6 +61,7 @@ public struct EmptyCollection<Element> :
   /// possible to advance indices.
   @warn_unused_result
   public func index(after i: Index) -> Index {
+    // TODO: swift-3-indexing-model: tests for traps.
     _preconditionFailure("EmptyCollection can't advance indices")
   }
 
@@ -70,6 +71,7 @@ public struct EmptyCollection<Element> :
   /// possible to advance indices.
   @warn_unused_result
   public func index(before i: Index) -> Index {
+    // TODO: swift-3-indexing-model: tests for traps.
     _preconditionFailure("EmptyCollection can't advance indices")
   }
 
@@ -84,6 +86,7 @@ public struct EmptyCollection<Element> :
   ///
   /// Should never be called, since this collection is always empty.
   public subscript(position: Index) -> Element {
+    // TODO: swift-3-indexing-model: tests for traps.
     get {
       _preconditionFailure("Index out of range")
     }
@@ -94,13 +97,10 @@ public struct EmptyCollection<Element> :
 
   public subscript(bounds: Range<Index>) -> EmptyCollection<Element> {
     get {
-      _precondition(bounds.lowerBound == 0 && bounds.upperBound == 0,
-        "Index out of range")
-      return self
+      _preconditionFailure("Index out of range")
     }
     set {
-      _precondition(bounds.lowerBound == 0 && bounds.upperBound == 0,
-        "Index out of range")
+      _preconditionFailure("Index out of range")
     }
   }
 
@@ -109,24 +109,22 @@ public struct EmptyCollection<Element> :
     return 0
   }
 
-  @warn_unused_result
   public func index(_ i: Index, offsetBy n: IndexDistance) -> Index {
-    _precondition(i == startIndex && n == 0, "Index out of range")
-    return i
+    // TODO: swift-3-indexing-model: tests for traps.
+    _preconditionFailure("EmptyCollection can't advance indices")
   }
 
-  @warn_unused_result
   public func index(
     _ i: Index, offsetBy n: IndexDistance, limitedBy limit: Index
   ) -> Index? {
-    _precondition(i == startIndex && limit == startIndex,
-      "Index out of range")
-    return n == 0 ? i : nil
+    // TODO: swift-3-indexing-model: tests for traps.
+    _preconditionFailure("EmptyCollection can't advance indices")
   }
 
   /// The distance between two indexes (always zero).
   @warn_unused_result
   public func distance(from start: Index, to end: Index) -> IndexDistance {
+    // TODO: swift-3-indexing-model: tests for traps.
     _precondition(start == 0, "From must be startIndex (or endIndex)")
     _precondition(end == 0, "To must be endIndex (or startIndex)")
     return 0
@@ -134,26 +132,18 @@ public struct EmptyCollection<Element> :
 
   public func _failEarlyRangeCheck(_ index: Index, bounds: Range<Index>) {
     _precondition(index == 0, "out of bounds")
-    _precondition(bounds == Range(indices),
+    _precondition(bounds.lowerBound == 0 && bounds.upperBound == 0,
       "invalid bounds for an empty collection")
   }
 
-  public func _failEarlyRangeCheck(
-    _ range: Range<Index>, bounds: Range<Index>
-  ) {
-    _precondition(range == Range(indices),
+  public func _failEarlyRangeCheck(_ range: Range<Index>, bounds: Range<Index>) {
+    _precondition(range.lowerBound == 0 && range.upperBound == 0,
       "invalid range for an empty collection")
-    _precondition(bounds == Range(indices),
+    _precondition(bounds.lowerBound == 0 && bounds.upperBound == 0,
       "invalid bounds for an empty collection")
   }
 
-  public typealias Indices = CountableRange<Int>
-}
-
-public func == <Element>(
-  lhs: EmptyCollection<Element>, rhs: EmptyCollection<Element>
-) -> Bool {
-  return true
+  // TODO: swift-3-indexing-model - fast fail any others from RandomAccessCollection (and up inheritance)?
 }
 
 @available(*, unavailable, renamed: "EmptyIterator")
@@ -162,6 +152,6 @@ public struct EmptyGenerator<Element> {}
 extension EmptyIterator {
   @available(*, unavailable, renamed: "makeIterator")
   public func generate() -> EmptyIterator<Element> {
-    Builtin.unreachable()
+    fatalError("unavailable function can't be called")
   }
 }

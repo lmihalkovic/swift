@@ -152,6 +152,21 @@ TypeRefBuilder::getBuiltinTypeInfo(const TypeRef *TR) {
   return nullptr;
 }
 
+const CaptureDescriptor *
+TypeRefBuilder::getCaptureDescriptor(uintptr_t RemoteAddress) {
+  for (auto Info : ReflectionInfos) {
+    for (auto &CD : Info.capture) {
+      auto OtherAddr = ((uintptr_t) &CD -
+                        Info.LocalStartAddress +
+                        Info.RemoteStartAddress);
+      if (OtherAddr == RemoteAddress)
+        return &CD;
+    }
+  }
+
+  return nullptr;
+}
+
 /// Get the unsubstituted capture types for a closure context.
 ClosureContextInfo
 TypeRefBuilder::getClosureContextInfo(const CaptureDescriptor &CD) {
@@ -190,7 +205,7 @@ TypeRefBuilder::getClosureContextInfo(const CaptureDescriptor &CD) {
 }
 
 ///
-/// Dumping reflection metadata
+/// Dumping typerefs, field declarations, associated types
 ///
 
 void
@@ -265,7 +280,11 @@ void TypeRefBuilder::dumpBuiltinTypeSection(std::ostream &OS) {
   }
 }
 
-void ClosureContextInfo::dump(std::ostream &OS) {
+void ClosureContextInfo::dump() const {
+  dump(std::cerr);
+}
+
+void ClosureContextInfo::dump(std::ostream &OS) const {
   OS << "- Capture types:\n";
   for (auto *TR : CaptureTypes) {
     if (TR == nullptr)
@@ -280,7 +299,7 @@ void ClosureContextInfo::dump(std::ostream &OS) {
     else
       MS.first->dump(OS);
     if (MS.second == nullptr)
-      OS << "!!! Invalid matadata source\n";
+      OS << "!!! Invalid metadata source\n";
     else
       MS.second->dump(OS);
   }
@@ -308,9 +327,5 @@ void TypeRefBuilder::dumpAllSections(std::ostream &OS) {
   OS << "BUILTIN TYPES:\n";
   OS << "==============\n";
   dumpBuiltinTypeSection(OS);
-  OS << '\n';
-  OS << "CAPTURE DESCRIPTORS:\n";
-  OS << "====================\n";
-  dumpCaptureSection(OS);
   OS << '\n';
 }
